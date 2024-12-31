@@ -90,17 +90,20 @@ class SolanaMonitor {
 
             // Define tokens to skip
             const SKIP_TOKENS = new Set([
-                this.WSOL_ADDRESS, // Wrapped SOL
                 'So11111111111111111111111111111111111111112', // Native SOL
                 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
                 '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', // USDC (alternate)
+                'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+                'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // Bonk (optional, remove if you want to track)
+                'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // mSOL (optional, remove if you want to track)
+                'DUSTawucrTsGU8hcqRdHDCbuYhCPADMLM2VcCb8VnFnQ', // DUST (optional, remove if you want to track)
             ]);
 
             // Look for token purchases (new tokens or balance increases)
             for (const postBalance of postTokenBalances) {
-                // Skip if token is SOL or USDC
+                // Skip if token is in the skip list
                 if (SKIP_TOKENS.has(postBalance.mint)) {
-                    console.log(`Skipping ${postBalance.mint} transaction (SOL/USDC)`);
+                    console.log(`Skipping ${postBalance.mint} transaction (common token)`);
                     continue;
                 }
 
@@ -109,9 +112,12 @@ class SolanaMonitor {
                 const postBal = Number(postBalance.uiTokenAmount.amount);
 
                 if (postBal > preBal) {
+                    const balanceIncrease = postBal - preBal;
                     console.log(`Purchase detected from ${wallet.label}:
                         Token: ${postBalance.mint}
-                        Amount: ${postBal - preBal}
+                        Previous Balance: ${preBal}
+                        New Balance: ${postBal}
+                        Increase: ${balanceIncrease}
                     `);
 
                     // Add transaction to processed set before executing copy trade
@@ -155,16 +161,17 @@ class SolanaMonitor {
             }
 
             try {
-                // 1. Get quote using fetch
-                const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${this.WSOL_ADDRESS}&outputMint=${purchaseInfo.tokenAddress}&amount=${this.tradeConfig.amountInLamports}&slippageBps=${this.tradeConfig.slippageBps}`;
-                const quoteResponse = await (await fetch(quoteUrl)).json();
-                
+                // 1. Get quote with restrictIntermediateTokens
+                const quoteResponse = await (
+                    await fetch(`https://quote-api.jup.ag/v6/quote?inputMint=${this.WSOL_ADDRESS}&outputMint=${purchaseInfo.tokenAddress}&amount=${this.tradeConfig.amountInLamports}&slippageBps=${this.tradeConfig.slippageBps}&restrictIntermediateTokens=true`)
+                ).json();
+
                 if (!quoteResponse) {
                     throw new Error('Failed to get quote from Jupiter');
                 }
 
-                // 2. Get swap transaction
-                const { swapTransaction } = await (
+                // 2. Get swap transaction with dynamic slippage and priority fees
+                const { swapTransaction, dynamicSlippageReport } = await (
                     await fetch('https://quote-api.jup.ag/v6/swap', {
                         method: 'POST',
                         headers: {
@@ -173,7 +180,21 @@ class SolanaMonitor {
                         body: JSON.stringify({
                             quoteResponse,
                             userPublicKey: this.traderWallet.publicKey.toString(),
-                            wrapAndUnwrapSol: true
+                            wrapUnwrapSOL: true,
+                            // Add dynamic slippage with higher maxBps for low liquidity
+                            dynamicSlippage: {
+                                minBps: 50,
+                                maxBps: 1000  // Increased for low liquidity tokens
+                            },
+                            // Add priority fees with very high priority
+                            prioritizationFeeLamports: {
+                                priorityLevelWithMaxLamports: {
+                                    maxLamports: 10000000, // 0.01 SOL max
+                                    priorityLevel: "veryHigh"
+                                }
+                            },
+                            // Enable dynamic compute units
+                            dynamicComputeUnitLimit: true
                         })
                     })
                 ).json();
@@ -182,14 +203,15 @@ class SolanaMonitor {
                     throw new Error('Failed to get swap transaction');
                 }
 
-                // 3. Deserialize the transaction
+                // Log slippage report for monitoring
+                console.log('Dynamic Slippage Report:', dynamicSlippageReport);
+
+                // 3. Execute the transaction
                 const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
                 const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-
-                // 4. Sign the transaction
+                
                 transaction.sign([this.traderWallet]);
 
-                // 5. Execute the transaction
                 console.log('Sending transaction...');
                 const rawTransaction = transaction.serialize();
                 const txid = await this.connection.sendRawTransaction(rawTransaction, {
@@ -199,16 +221,17 @@ class SolanaMonitor {
                 
                 console.log(`Transaction sent: ${txid}`);
 
-                // 6. Confirm transaction
+                // 4. Confirm transaction
                 await this.connection.confirmTransaction(txid);
                 console.log('Transaction confirmed!');
 
                 const executionTime = ((Date.now() - startTime) / 1000).toFixed(2);
-                console.log(`Copy trade completed in ${executionTime}s`);
                 
+                // Include slippage info in success message
                 const successMessage = `✅ Copy Trade Executed!\n\n` +
                     `*Token:* ${purchaseInfo.symbol}\n` +
                     `*Amount:* ${this.tradeConfig.amountInSol} SOL\n` +
+                    `*Used Slippage:* ${dynamicSlippageReport?.slippageBps || 'N/A'}bps\n` +
                     `*Transaction:* [View](https://solscan.io/tx/${txid})\n` +
                     `*Execution Time:* ${executionTime}s`;
                 
