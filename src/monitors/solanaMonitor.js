@@ -78,12 +78,11 @@ class SolanaMonitor {
         if (!transaction?.meta) return;
 
         try {
-            // Check if we've already processed this transaction
             const txSignature = transaction.transaction.signatures[0];
-            if (this.processedTxs.has(txSignature)) {
-                console.log(`[${this.CHAIN_NAME}] Transaction already processed:`, txSignature);
-                return;
-            }
+            if (this.processedTxs.has(txSignature)) return;
+
+            // Add transaction to processed set immediately to prevent duplicate processing
+            this.processedTxs.add(txSignature);
 
             const postTokenBalances = transaction.meta.postTokenBalances || [];
             const preTokenBalances = transaction.meta.preTokenBalances || [];
@@ -99,54 +98,82 @@ class SolanaMonitor {
                 'DUSTawucrTsGU8hcqRdHDCbuYhCPADMLM2VcCb8VnFnQ', // DUST
             ]);
 
+            // Track if we've already executed a copy trade for this transaction
+            let copyTradeExecuted = false;
+
             // Look for token purchases (new tokens or balance increases)
             for (const postBalance of postTokenBalances) {
-                // Skip if token is in the skip list
-                if (SKIP_TOKENS.has(postBalance.mint)) {
-                    console.log(`Skipping ${postBalance.mint} transaction (common token)`);
-                    continue;
-                }
+                if (SKIP_TOKENS.has(postBalance.mint)) continue;
 
                 const preBalance = preTokenBalances.find(b => b.mint === postBalance.mint);
                 const preBal = preBalance ? Number(preBalance.uiTokenAmount.amount) : 0;
                 const postBal = Number(postBalance.uiTokenAmount.amount);
 
-                if (postBal > preBal) {
+                if (postBal > preBal && !copyTradeExecuted) {
                     const balanceIncrease = postBal - preBal;
-                    console.log(`[${this.CHAIN_NAME}] Purchase detected from ${wallet.label}:
+                    console.log(`[${this.CHAIN_NAME}] Purchase detected by ${wallet.label}:
                         Token: ${postBalance.mint}
                         Previous Balance: ${preBal}
                         New Balance: ${postBal}
                         Increase: ${balanceIncrease}
                     `);
 
-                    // Add transaction to processed set before executing copy trade
-                    this.processedTxs.add(txSignature);
-
                     await this.executeCopyTrade({
                         tokenAddress: postBalance.mint,
-                        symbol: postBalance.mint.slice(0, 4) + '...' // Simple symbol display
+                        symbol: postBalance.mint.slice(0, 4) + '...',
+                        sourceWallet: wallet.label
                     });
 
-                    // Clean up old transactions from the Set (keep last 1000)
-                    if (this.processedTxs.size > 1000) {
-                        const txsArray = Array.from(this.processedTxs);
-                        this.processedTxs = new Set(txsArray.slice(-1000));
-                    }
+                    // Mark that we've executed a copy trade for this transaction
+                    copyTradeExecuted = true;
                 }
             }
+
+            // Clean up old transactions from the Set (keep last 1000)
+            if (this.processedTxs.size > 1000) {
+                const txsArray = Array.from(this.processedTxs);
+                this.processedTxs = new Set(txsArray.slice(-1000));
+            }
+
         } catch (error) {
             console.error(`Error analyzing transaction for ${wallet.label}:`, error);
         }
     }
 
     async executeCopyTrade(purchaseInfo) {
+        const startTime = Date.now();
+        const MAX_RETRIES = 3;
+        let currentTry = 0;
+
         try {
-            const startTime = Date.now();
-            console.log(`[${this.CHAIN_NAME}] Starting copy trade for ${purchaseInfo.symbol}...`);
-            
+            console.log(`[${this.CHAIN_NAME}] Starting copy trade for ${purchaseInfo.symbol} - Following ${purchaseInfo.sourceWallet}`);
+
             if (!this.traderWallet) {
                 throw new Error('Trader wallet not configured');
+            }
+
+            // Check if we already hold this token
+            try {
+                const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                    this.traderWallet.publicKey,
+                    { mint: new PublicKey(purchaseInfo.tokenAddress) }
+                );
+
+                if (tokenAccounts.value.length > 0) {
+                    const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
+                    if (Number(balance.amount) > 0) {
+                        console.log(`[${this.CHAIN_NAME}] Already holding ${purchaseInfo.symbol}, skipping purchase`);
+                        await this.sendTelegramMessage(
+                            `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                            `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.symbol}*\n` +
+                            `You already hold this token - Trade skipped`,
+                            true
+                        );
+                        return;
+                    }
+                }
+            } catch (error) {
+                console.error(`[${this.CHAIN_NAME}] Error checking token balance:`, error);
             }
 
             // Check wallet balance
@@ -156,93 +183,121 @@ class SolanaMonitor {
             if (balance < requiredBalance) {
                 const errorMsg = `Insufficient SOL balance. Required: ${(requiredBalance / 1e9).toFixed(3)} SOL, Available: ${(balance / 1e9).toFixed(3)} SOL`;
                 console.error(errorMsg);
-                await this.sendTelegramMessage(`⚠️ Trade Skipped - ${errorMsg}`, true);
+                await this.sendTelegramMessage(
+                    `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                    `*${purchaseInfo.sourceWallet}* bought *${purchaseInfo.symbol}*\n\n` +
+                    `⚠️ Trade Skipped - ${errorMsg}`,
+                    true
+                );
                 return;
             }
 
-            try {
-                // 1. Get quote with restrictIntermediateTokens
-                const quoteResponse = await (
-                    await fetch(`https://quote-api.jup.ag/v6/quote?inputMint=${this.WSOL_ADDRESS}&outputMint=${purchaseInfo.tokenAddress}&amount=${this.tradeConfig.amountInLamports}&slippageBps=${this.tradeConfig.slippageBps}&restrictIntermediateTokens=true`)
-                ).json();
+            while (currentTry < MAX_RETRIES) {
+                try {
+                    currentTry++;
+                    console.log(`[${this.CHAIN_NAME}] Attempt ${currentTry} of ${MAX_RETRIES}`);
 
-                if (!quoteResponse) {
-                    throw new Error('Failed to get quote from Jupiter');
-                }
+                    // 1. Get quote with restrictIntermediateTokens
+                    const quoteResponse = await (
+                        await fetch(`https://quote-api.jup.ag/v6/quote?inputMint=${this.WSOL_ADDRESS}&outputMint=${purchaseInfo.tokenAddress}&amount=${this.tradeConfig.amountInLamports}&slippageBps=${this.tradeConfig.slippageBps}&restrictIntermediateTokens=true`)
+                    ).json();
 
-                // 2. Get swap transaction with dynamic slippage and priority fees
-                const { swapTransaction, dynamicSlippageReport } = await (
-                    await fetch('https://quote-api.jup.ag/v6/swap', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            quoteResponse,
-                            userPublicKey: this.traderWallet.publicKey.toString(),
-                            wrapUnwrapSOL: true,
-                            dynamicSlippage: {
-                                minBps: 50,
-                                maxBps: 1000  // Increased for low liquidity tokens
+                    if (!quoteResponse) {
+                        throw new Error('Failed to get quote from Jupiter');
+                    }
+
+                    // 2. Get swap transaction with dynamic slippage and priority fees
+                    const { swapTransaction, dynamicSlippageReport } = await (
+                        await fetch('https://quote-api.jup.ag/v6/swap', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
                             },
-                            prioritizationFeeLamports: {
-                                priorityLevelWithMaxLamports: {
-                                    maxLamports: 10000000, // 0.01 SOL max
-                                    priorityLevel: "veryHigh"
-                                }
-                            },
-                            dynamicComputeUnitLimit: true
+                            body: JSON.stringify({
+                                quoteResponse,
+                                userPublicKey: this.traderWallet.publicKey.toString(),
+                                wrapUnwrapSOL: true,
+                                dynamicSlippage: {
+                                    minBps: 50,
+                                    maxBps: 1000
+                                },
+                                prioritizationFeeLamports: {
+                                    priorityLevelWithMaxLamports: {
+                                        maxLamports: 10000000,
+                                        priorityLevel: "veryHigh"
+                                    }
+                                },
+                                dynamicComputeUnitLimit: true
+                            })
                         })
-                    })
-                ).json();
+                    ).json();
 
-                if (!swapTransaction) {
-                    throw new Error('Failed to get swap transaction');
+                    if (!swapTransaction) {
+                        throw new Error('Failed to get swap transaction');
+                    }
+
+                    console.log('Dynamic Slippage Report:', dynamicSlippageReport);
+
+                    // 3. Execute the transaction
+                    const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+                    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+                    
+                    transaction.sign([this.traderWallet]);
+
+                    console.log('Sending transaction...');
+                    const rawTransaction = transaction.serialize();
+                    const txid = await this.connection.sendRawTransaction(rawTransaction, {
+                        skipPreflight: true,
+                        maxRetries: 2
+                    });
+                    
+                    console.log(`Transaction sent: ${txid}`);
+
+                    // 4. Confirm transaction with new strategy
+                    const latestBlockhash = await this.connection.getLatestBlockhash();
+                    const confirmation = await this.connection.confirmTransaction({
+                        signature: txid,
+                        blockhash: latestBlockhash.blockhash,
+                        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+                    }, 'confirmed');
+
+                    if (confirmation.value.err) {
+                        throw new Error(`Transaction failed: ${confirmation.value.err}`);
+                    }
+
+                    console.log('Transaction confirmed!');
+
+                    const executionTime = ((Date.now() - startTime) / 1000).toFixed(2);
+                    
+                    const successMessage = `✅ ${this.CHAIN_NAME} Copy Trade Executed!\n\n` +
+                        `*Token:* ${purchaseInfo.symbol}\n` +
+                        `*Following:* ${purchaseInfo.sourceWallet}\n` +
+                        `*Amount:* ${this.tradeConfig.amountInSol} SOL\n` +
+                        `*Used Slippage:* ${dynamicSlippageReport?.slippageBps || 'N/A'}bps\n` +
+                        `*Transaction:* [View](https://solscan.io/tx/${txid})\n` +
+                        `*Execution Time:* ${executionTime}s`;
+                    
+                    await this.sendTelegramMessage(successMessage, true);
+                    return; // Success - exit the retry loop
+
+                } catch (error) {
+                    if (error.response?.data?.error === 'No route found') {
+                        console.log(`No route found for token: ${purchaseInfo.symbol}`);
+                        await this.sendTelegramMessage(`ℹ️ Trade Skipped - No route found: ${purchaseInfo.symbol}`, true);
+                        return;
+                    }
+                    
+                    console.error(`[${this.CHAIN_NAME}] Attempt ${currentTry} failed:`, error);
+
+                    if (currentTry === MAX_RETRIES) {
+                        throw error; // Rethrow on final attempt
+                    }
+
+                    // Wait before retrying (exponential backoff)
+                    const waitTime = Math.min(1000 * Math.pow(2, currentTry - 1), 10000);
+                    console.log(`[${this.CHAIN_NAME}] Waiting ${waitTime}ms before retry...`);
+                    await new Promise(resolve => setTimeout(resolve, waitTime));
                 }
-
-                // Log slippage report for monitoring
-                console.log('Dynamic Slippage Report:', dynamicSlippageReport);
-
-                // 3. Execute the transaction
-                const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-                const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-                
-                transaction.sign([this.traderWallet]);
-
-                console.log('Sending transaction...');
-                const rawTransaction = transaction.serialize();
-                const txid = await this.connection.sendRawTransaction(rawTransaction, {
-                    skipPreflight: true,
-                    maxRetries: 2
-                });
-                
-                console.log(`Transaction sent: ${txid}`);
-
-                // 4. Confirm transaction
-                await this.connection.confirmTransaction(txid);
-                console.log('Transaction confirmed!');
-
-                const executionTime = ((Date.now() - startTime) / 1000).toFixed(2);
-                
-                // Include slippage info in success message
-                const successMessage = `✅ ${this.CHAIN_NAME} Copy Trade Executed!\n\n` +
-                    `*Token:* ${purchaseInfo.symbol}\n` +
-                    `*Amount:* ${this.tradeConfig.amountInSol} SOL\n` +
-                    `*Used Slippage:* ${dynamicSlippageReport?.slippageBps || 'N/A'}bps\n` +
-                    `*Transaction:* [View](https://solscan.io/tx/${txid})\n` +
-                    `*Execution Time:* ${executionTime}s`;
-                
-                await this.sendTelegramMessage(successMessage, true);
-
-            } catch (error) {
-                if (error.response?.data?.error === 'No route found') {
-                    console.log(`No route found for token: ${purchaseInfo.symbol}`);
-                    await this.sendTelegramMessage(`ℹ️ Trade Skipped - No route found: ${purchaseInfo.symbol}`, true);
-                    return;
-                }
-                
-                console.error('Full error:', error);
-                throw error;
             }
 
         } catch (error) {

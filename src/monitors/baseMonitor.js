@@ -22,6 +22,7 @@ class BaseMonitor {
             '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'.toLowerCase(), // USDC
             '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb'.toLowerCase(), // USDT
             '0x0000000000000000000000000000000000000000'.toLowerCase(), // Native ETH
+            '0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b'.toLowerCase(), // VIRTUAL
         ]);
     }
 
@@ -151,13 +152,6 @@ class BaseMonitor {
             const receipt = await this.provider.getTransactionReceipt(tx.hash);
             if (!receipt) return;
 
-            console.log(`[${this.CHAIN_NAME}] Analyzing transaction:`, {
-                hash: tx.hash,
-                from: tx.from,
-                to: tx.to,
-                logs: receipt.logs.length
-            });
-
             // Look for token purchases in logs
             const purchaseEvents = receipt.logs.filter(log => {
                 // Check if this is a Transfer event
@@ -178,31 +172,43 @@ class BaseMonitor {
                 return toAddress === wallet.address.toLowerCase();
             });
 
-            if (purchaseEvents.length > 0) {
-                console.log(`[${this.CHAIN_NAME}] Found ${purchaseEvents.length} relevant transfer events`);
-            }
-
             for (const event of purchaseEvents) {
                 const tokenAddress = event.address.toLowerCase();
                 
                 // Skip if token is in the skip list
-                if (this.SKIP_TOKENS.has(tokenAddress)) {
-                    console.log(`[${this.CHAIN_NAME}] Skipping ${tokenAddress} transaction (common token)`);
-                    continue;
+                if (this.SKIP_TOKENS.has(tokenAddress)) continue;
+
+                // Get token metadata
+                const tokenContract = new ethers.Contract(
+                    tokenAddress,
+                    ['function symbol() view returns (string)', 'function name() view returns (string)'],
+                    this.provider
+                );
+                
+                let symbol, name;
+                try {
+                    [symbol, name] = await Promise.all([
+                        tokenContract.symbol(),
+                        tokenContract.name()
+                    ]);
+                } catch (error) {
+                    symbol = tokenAddress.slice(0, 6) + '...';
+                    name = 'Unknown Token';
                 }
 
-                console.log(`[${this.CHAIN_NAME}] Purchase detected from ${wallet.label}:
-                    Token: ${tokenAddress}
+                console.log(`[${this.CHAIN_NAME}] Purchase detected by ${wallet.label}:
+                    Token: ${name} (${symbol})
+                    Address: ${tokenAddress}
                     Transaction: ${tx.hash}
-                    LogIndex: ${event.logIndex}
-                    Data: ${event.data}
                 `);
 
                 this.processedTxs.add(tx.hash);
                 
                 await this.executeCopyTrade({
                     tokenAddress,
-                    symbol: tokenAddress.slice(0, 6) + '...'
+                    symbol,
+                    name,
+                    sourceWallet: wallet.label
                 });
             }
 
@@ -218,14 +224,36 @@ class BaseMonitor {
     }
 
     async executeCopyTrade(purchaseInfo) {
+        const startTime = Date.now();
+        const MAX_RETRIES = 3;
+        let currentTry = 0;
+
         try {
-            const startTime = Date.now();
-            console.log(`[${this.CHAIN_NAME}] Starting copy trade:`, {
-                token: purchaseInfo.tokenAddress,
-                symbol: purchaseInfo.symbol,
-                amount: this.tradeConfig.amountInETH,
-                slippage: this.tradeConfig.slippageBps
-            });
+            // Check if we already hold this token
+            const tokenContract = new ethers.Contract(
+                purchaseInfo.tokenAddress,
+                ['function balanceOf(address) view returns (uint256)'],
+                this.provider
+            );
+
+            try {
+                const balance = await tokenContract.balanceOf(this.traderWallet.address);
+                if (balance.gt(0)) {
+                    console.log(`[${this.CHAIN_NAME}] Already holding ${purchaseInfo.symbol}, skipping purchase`);
+                    await this.sendTelegramMessage(
+                        `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                        `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.name} (${purchaseInfo.symbol})*\n` +
+                        `You already hold this token - Trade skipped`,
+                        true
+                    );
+                    return;
+                }
+            } catch (error) {
+                console.error(`[${this.CHAIN_NAME}] Error checking token balance:`, error);
+                // Continue with trade if balance check fails
+            }
+
+            console.log(`[${this.CHAIN_NAME}] Starting copy trade for ${purchaseInfo.name} (${purchaseInfo.symbol}) - Following ${purchaseInfo.sourceWallet}`);
 
             if (!this.traderWallet) {
                 throw new Error('Trader wallet not configured');
@@ -235,13 +263,6 @@ class BaseMonitor {
             const balance = await this.provider.getBalance(this.traderWallet.address);
             const requiredBalance = ethers.utils.parseEther(this.tradeConfig.amountInETH);
 
-            console.log(`[${this.CHAIN_NAME}] Balance check:`, {
-                balance: ethers.utils.formatEther(balance),
-                required: this.tradeConfig.amountInETH,
-                balanceWei: balance.toString(),
-                requiredWei: requiredBalance.toString()
-            });
-
             if (balance.lt(requiredBalance)) {
                 const errorMsg = `Insufficient ETH balance. Required: ${this.tradeConfig.amountInETH} ETH, Available: ${ethers.utils.formatEther(balance)} ETH`;
                 console.error(errorMsg);
@@ -249,142 +270,135 @@ class BaseMonitor {
                 return;
             }
 
-            try {
-                const ETH_ADDRESS = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+            while (currentTry < MAX_RETRIES) {
+                try {
+                    currentTry++;
+                    console.log(`[${this.CHAIN_NAME}] Attempt ${currentTry} of ${MAX_RETRIES}`);
 
-                // 1. Get price quote
-                const params = new URLSearchParams({
-                    chainId: this.CHAIN_ID.toString(),
-                    sellToken: ETH_ADDRESS,
-                    buyToken: purchaseInfo.tokenAddress,
-                    sellAmount: ethers.utils.parseEther(this.tradeConfig.amountInETH).toString(),
-                    taker: this.traderWallet.address,
-                    slippageBps: this.tradeConfig.slippageBps.toString()
-                });
+                    const ETH_ADDRESS = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
 
-                const priceResponse = await axios.get(
-                    `${this.ZERO_X_API}/swap/permit2/price?${params.toString()}`,
-                    {
-                        headers: {
-                            '0x-api-key': this.ZERO_X_API_KEY,
-                            '0x-version': 'v2',
-                            'Content-Type': 'application/json'
+                    // 1. Get price quote with more details
+                    const params = new URLSearchParams({
+                        chainId: this.CHAIN_ID.toString(),
+                        sellToken: ETH_ADDRESS,
+                        buyToken: purchaseInfo.tokenAddress,
+                        sellAmount: ethers.utils.parseEther(this.tradeConfig.amountInETH).toString(),
+                        taker: this.traderWallet.address,
+                        slippageBps: this.tradeConfig.slippageBps.toString(),
+                        skipValidation: true,
+                        enableSlippageProtection: false
+                    });
+
+                    const priceResponse = await axios.get(
+                        `${this.ZERO_X_API}/swap/permit2/price?${params.toString()}`,
+                        {
+                            headers: {
+                                '0x-api-key': this.ZERO_X_API_KEY,
+                                '0x-version': 'v2',
+                                'Content-Type': 'application/json'
+                            }
                         }
-                    }
-                );
-
-                console.log(`[${this.CHAIN_NAME}] Price response:`, priceResponse.data);
-
-                if (!priceResponse.data.liquidityAvailable) {
-                    throw new Error('Insufficient liquidity for trade');
-                }
-
-                // 2. Get quote using same parameters
-                const response = await axios.get(
-                    `${this.ZERO_X_API}/swap/permit2/quote?${params.toString()}`,
-                    {
-                        headers: {
-                            '0x-api-key': this.ZERO_X_API_KEY,
-                            '0x-version': 'v2',
-                            'Content-Type': 'application/json'
-                        }
-                    }
-                );
-
-                const quote = response.data;
-
-                // 3. Get transaction details from quote
-                if (!quote.transaction?.to || !quote.transaction?.data) {
-                    throw new Error(`Invalid quote response: missing transaction details. Response: ${JSON.stringify(quote, null, 2)}`);
-                }
-
-                console.log(`[${this.CHAIN_NAME}] Quote response:`, {
-                    to: quote.transaction.to,
-                    data: quote.transaction.data ? 'Present' : 'Missing',
-                    value: quote.value,
-                    gas: quote.gas,
-                    estimatedGas: quote.estimatedGas,
-                    buyAmount: quote.buyAmount,
-                    sellAmount: quote.sellAmount
-                });
-
-                // Handle permit2 signature if needed
-                if (quote.permit2?.eip712) {
-                    const signature = await this.traderWallet.signTypedData(
-                        quote.permit2.eip712.domain,
-                        quote.permit2.eip712.types,
-                        quote.permit2.eip712.message
                     );
 
-                    // Append signature to transaction data
-                    const sigLengthHex = ethers.utils.hexZeroPad(
-                        ethers.utils.hexlify(signature.length),
-                        32
+                    console.log(`[${this.CHAIN_NAME}] Price quote response:`, {
+                        price: priceResponse.data.price,
+                        estimatedGas: priceResponse.data.estimatedGas,
+                        liquidityAvailable: priceResponse.data.liquidityAvailable,
+                        sellAmount: priceResponse.data.sellAmount,
+                        buyAmount: priceResponse.data.buyAmount
+                    });
+
+                    if (!priceResponse.data.liquidityAvailable) {
+                        throw new Error('Insufficient liquidity for trade');
+                    }
+
+                    // 2. Get quote with same parameters
+                    const response = await axios.get(
+                        `${this.ZERO_X_API}/swap/permit2/quote?${params.toString()}`,
+                        {
+                            headers: {
+                                '0x-api-key': this.ZERO_X_API_KEY,
+                                '0x-version': 'v2',
+                                'Content-Type': 'application/json'
+                            }
+                        }
                     );
-                    quote.transaction.data = ethers.utils.hexConcat([
-                        quote.transaction.data,
-                        sigLengthHex,
-                        signature
-                    ]);
+
+                    const quote = response.data;
+
+                    // Prepare and send transaction with higher gas
+                    const tx = {
+                        to: quote.transaction.to,
+                        data: quote.transaction.data,
+                        value: ethers.utils.parseEther(this.tradeConfig.amountInETH),
+                        gasLimit: Math.floor((quote.gas || quote.estimatedGas || 500000) * 1.5),
+                        maxFeePerGas: ethers.utils.parseUnits('1', 'gwei'),
+                        maxPriorityFeePerGas: ethers.utils.parseUnits('1', 'gwei')
+                    };
+
+                    console.log(`[${this.CHAIN_NAME}] Full transaction details:`, {
+                        to: tx.to,
+                        value: ethers.utils.formatEther(tx.value),
+                        gasLimit: tx.gasLimit.toString(),
+                        maxFeePerGas: ethers.utils.formatUnits(tx.maxFeePerGas, 'gwei') + ' gwei',
+                        maxPriorityFeePerGas: ethers.utils.formatUnits(tx.maxPriorityFeePerGas, 'gwei') + ' gwei',
+                        data: tx.data.slice(0, 66) + '...'
+                    });
+
+                    console.log(`[${this.CHAIN_NAME}] Sending swap transaction...`);
+                    const txResponse = await this.traderWallet.sendTransaction(tx);
+                    console.log(`[${this.CHAIN_NAME}] Transaction sent:`, txResponse.hash);
+
+                    const receipt = await txResponse.wait();
+                    
+                    if (receipt.status === 0) {
+                        throw new Error('Transaction failed on-chain. Check transaction for details.');
+                    }
+
+                    console.log(`[${this.CHAIN_NAME}] Transaction confirmed! Status:`, receipt.status);
+
+                    const executionTime = ((Date.now() - startTime) / 1000).toFixed(2);
+                    
+                    const successMessage = `✅ ${this.CHAIN_NAME} Copy Trade Executed!\n\n` +
+                        `*Token:* ${purchaseInfo.name} (${purchaseInfo.symbol})\n` +
+                        `*Following:* ${purchaseInfo.sourceWallet}\n` +
+                        `*Amount:* ${this.tradeConfig.amountInETH} ETH\n` +
+                        `*Transaction:* [View](https://basescan.org/tx/${receipt.hash})\n` +
+                        `*Gas Used:* ${receipt.gasUsed.toString()}\n` +
+                        `*Execution Time:* ${executionTime}s`;
+
+                    await this.sendTelegramMessage(successMessage, true);
+                    return; // Success - exit the retry loop
+
+                } catch (error) {
+                    let errorMessage = error.message;
+                    
+                    if (error.response?.data?.validationErrors?.[0]?.reason === 'INSUFFICIENT_ASSET_LIQUIDITY') {
+                        console.log(`[${this.CHAIN_NAME}] No liquidity for token: ${purchaseInfo.symbol}`);
+                        await this.sendTelegramMessage(`ℹ️ Trade Skipped - No liquidity: ${purchaseInfo.symbol}`, true);
+                        return;
+                    }
+
+                    if (error.code === 'CALL_EXCEPTION') {
+                        errorMessage = 'Transaction reverted on-chain. Possible reasons: insufficient liquidity, high slippage, or contract error';
+                        console.error(`[${this.CHAIN_NAME}] Transaction failed:`, {
+                            error: error.message,
+                            transaction: error.transaction,
+                            receipt: error.receipt
+                        });
+                    }
+
+                    console.error(`[${this.CHAIN_NAME}] Attempt ${currentTry} failed:`, errorMessage);
+
+                    if (currentTry === MAX_RETRIES) {
+                        throw new Error(errorMessage); // Rethrow on final attempt
+                    }
+
+                    // Wait before retrying (exponential backoff)
+                    const waitTime = Math.min(1000 * Math.pow(2, currentTry - 1), 10000);
+                    console.log(`[${this.CHAIN_NAME}] Waiting ${waitTime}ms before retry...`);
+                    await new Promise(resolve => setTimeout(resolve, waitTime));
                 }
-
-                // Prepare and send transaction
-                const tx = {
-                    to: quote.transaction.to,
-                    data: quote.transaction.data,
-                    value: ethers.utils.parseEther(this.tradeConfig.amountInETH),
-                    gasLimit: Math.floor((quote.gas || quote.estimatedGas || 300000) * 1.1),
-                    maxFeePerGas: ethers.utils.parseUnits('0.5', 'gwei'),
-                    maxPriorityFeePerGas: ethers.utils.parseUnits('0.5', 'gwei')
-                };
-
-                // Validate transaction parameters
-                console.log(`[${this.CHAIN_NAME}] Transaction validation:`, {
-                    hasTo: !!tx.to,
-                    hasData: !!tx.data,
-                    value: ethers.utils.formatEther(tx.value),
-                    rawValue: tx.value.toString(),
-                    gasLimit: tx.gasLimit.toString()
-                });
-
-                if (!tx.to || !tx.data) {
-                    throw new Error('Invalid quote response: missing to or data field');
-                }
-
-                console.log(`[${this.CHAIN_NAME}] Transaction details:`, {
-                    to: tx.to,
-                    value: ethers.utils.formatEther(tx.value),
-                    gasLimit: tx.gasLimit.toString(),
-                    maxFeePerGas: tx.maxFeePerGas.toString(),
-                    maxPriorityFeePerGas: tx.maxPriorityFeePerGas.toString()
-                });
-
-                console.log(`[${this.CHAIN_NAME}] Sending swap transaction...`);
-                const txResponse = await this.traderWallet.sendTransaction(tx);
-                console.log(`[${this.CHAIN_NAME}] Transaction sent:`, txResponse.hash);
-
-                const receipt = await txResponse.wait();
-                console.log(`[${this.CHAIN_NAME}] Transaction confirmed!`);
-
-                const executionTime = ((Date.now() - startTime) / 1000).toFixed(2);
-                
-                const successMessage = `✅ ${this.CHAIN_NAME} Copy Trade Executed!\n\n` +
-                    `*Token:* ${purchaseInfo.symbol}\n` +
-                    `*Amount:* ${this.tradeConfig.amountInETH} ETH\n` +
-                    `*Price:* ${quote.price}\n` +
-                    `*Transaction:* [View](https://basescan.org/tx/${receipt.hash})\n` +
-                    `*Gas Used:* ${receipt.gasUsed.toString()}\n` +
-                    `*Execution Time:* ${executionTime}s`;
-
-                await this.sendTelegramMessage(successMessage, true);
-
-            } catch (error) {
-                if (error.response?.data?.validationErrors?.[0]?.reason === 'INSUFFICIENT_ASSET_LIQUIDITY') {
-                    console.log(`[${this.CHAIN_NAME}] No liquidity for token: ${purchaseInfo.symbol}`);
-                    await this.sendTelegramMessage(`ℹ️ Trade Skipped - No liquidity: ${purchaseInfo.symbol}`, true);
-                    return;
-                }
-                throw error;
             }
 
         } catch (error) {
@@ -395,14 +409,28 @@ class BaseMonitor {
 
     async sendTelegramMessage(message, parseMarkdown = false) {
         try {
+            // Escape special characters if using markdown
+            let formattedMessage = message;
+            if (parseMarkdown) {
+                formattedMessage = message.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+            }
+
             const url = `https://api.telegram.org/bot${this.telegramToken}/sendMessage`;
-            await axios.post(url, {
+            const response = await axios.post(url, {
                 chat_id: this.telegramChatId,
-                text: message,
-                parse_mode: parseMarkdown ? 'Markdown' : undefined
+                text: formattedMessage,
+                parse_mode: parseMarkdown ? 'MarkdownV2' : undefined,
+                disable_web_page_preview: true
             });
+
+            if (!response.data?.ok) {
+                console.error(`[${this.CHAIN_NAME}] Telegram API error:`, response.data);
+            }
         } catch (error) {
-            console.error('Error sending telegram message:', error);
+            console.error(`[${this.CHAIN_NAME}] Error sending telegram message:`, {
+                error: error.message,
+                response: error.response?.data
+            });
         }
     }
 

@@ -1,2 +1,16 @@
+# Config files
+config.json
 .env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Dependencies
 node_modules/
+
+# IDE files
+.vscode/
+.idea/
