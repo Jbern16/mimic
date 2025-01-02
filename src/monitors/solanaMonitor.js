@@ -79,7 +79,12 @@ class SolanaMonitor {
 
         try {
             const txSignature = transaction.transaction.signatures[0];
-            if (this.processedTxs.has(txSignature)) return;
+            console.log(`[${this.CHAIN_NAME}] Analyzing transaction ${txSignature} from ${wallet.label}`);
+            
+            if (this.processedTxs.has(txSignature)) {
+                console.log(`[${this.CHAIN_NAME}] Skipping already processed transaction: ${txSignature}`);
+                return;
+            }
 
             // Add transaction to processed set immediately to prevent duplicate processing
             this.processedTxs.add(txSignature);
@@ -87,58 +92,38 @@ class SolanaMonitor {
             const postTokenBalances = transaction.meta.postTokenBalances || [];
             const preTokenBalances = transaction.meta.preTokenBalances || [];
 
-            // Define tokens to skip
-            const SKIP_TOKENS = new Set([
-                'So11111111111111111111111111111111111111112', // Native SOL
-                'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-                '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', // USDC (alternate)
-                'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
-                'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // Bonk
-                'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // mSOL
-                'DUSTawucrTsGU8hcqRdHDCbuYhCPADMLM2VcCb8VnFnQ', // DUST
-            ]);
+            console.log(`[${this.CHAIN_NAME}] Pre-token balances:`, preTokenBalances.map(b => ({
+                mint: b.mint,
+                amount: b.uiTokenAmount.amount,
+                decimals: b.uiTokenAmount.decimals
+            })));
+            console.log(`[${this.CHAIN_NAME}] Post-token balances:`, postTokenBalances.map(b => ({
+                mint: b.mint,
+                amount: b.uiTokenAmount.amount,
+                decimals: b.uiTokenAmount.decimals
+            })));
 
             // Track if we've already executed a copy trade for this transaction
             let copyTradeExecuted = false;
 
-            // Check for sells of tokens we hold
-            for (const preBalance of preTokenBalances) {
-                const tokenMint = preBalance.mint;
-                // Check if we currently hold this token
-                try {
-                    const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
-                        this.traderWallet.publicKey,
-                        { mint: new PublicKey(tokenMint) }
-                    );
-
-                    if (tokenAccounts.value.length > 0) {
-                        const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
-                        if (Number(balance.amount) > 0) {
-                            const postBalance = postTokenBalances.find(b => b.mint === tokenMint);
-                            const preBal = Number(preBalance.uiTokenAmount.amount);
-                            const postBal = postBalance ? Number(postBalance.uiTokenAmount.amount) : 0;
-
-                            if (postBal < preBal) {
-                                await this.notifySell({
-                                    tokenMint,
-                                    sourceWallet: wallet.label,
-                                    txSignature
-                                });
-                            }
-                        }
-                    }
-                } catch (error) {
-                    console.error(`Error checking token balance:`, error);
-                }
-            }
-
             // Look for token purchases (new tokens or balance increases)
             for (const postBalance of postTokenBalances) {
-                if (SKIP_TOKENS.has(postBalance.mint)) continue;
+                console.log(`[${this.CHAIN_NAME}] Checking token: ${postBalance.mint}`);
+                
+                if (SKIP_TOKENS.has(postBalance.mint)) {
+                    console.log(`[${this.CHAIN_NAME}] Skipping ignored token: ${postBalance.mint}`);
+                    continue;
+                }
 
                 const preBalance = preTokenBalances.find(b => b.mint === postBalance.mint);
                 const preBal = preBalance ? Number(preBalance.uiTokenAmount.amount) : 0;
                 const postBal = Number(postBalance.uiTokenAmount.amount);
+
+                console.log(`[${this.CHAIN_NAME}] Balance change for ${postBalance.mint}:`, {
+                    pre: preBal,
+                    post: postBal,
+                    change: postBal - preBal
+                });
 
                 if (postBal > preBal && !copyTradeExecuted) {
                     const balanceIncrease = postBal - preBal;
@@ -155,9 +140,17 @@ class SolanaMonitor {
                         sourceWallet: wallet.label
                     });
 
-                    // Mark that we've executed a copy trade for this transaction
                     copyTradeExecuted = true;
+                } else {
+                    console.log(`[${this.CHAIN_NAME}] No purchase detected:`, {
+                        balanceIncreased: postBal > preBal,
+                        alreadyExecuted: copyTradeExecuted
+                    });
                 }
+            }
+
+            if (postTokenBalances.length === 0) {
+                console.log(`[${this.CHAIN_NAME}] No token balances found in transaction`);
             }
 
             // Clean up old transactions from the Set (keep last 1000)
@@ -168,6 +161,12 @@ class SolanaMonitor {
 
         } catch (error) {
             console.error(`Error analyzing transaction for ${wallet.label}:`, error);
+            console.error('Transaction details:', {
+                signature: transaction.transaction.signatures[0],
+                accounts: transaction.transaction.message.accountKeys.map(key => key.toString()),
+                error: error.message,
+                stack: error.stack
+            });
         }
     }
 

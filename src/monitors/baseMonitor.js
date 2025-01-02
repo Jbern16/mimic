@@ -24,9 +24,6 @@ class BaseMonitor {
             '0x0000000000000000000000000000000000000000'.toLowerCase(), // Native ETH
             '0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b'.toLowerCase(), // VIRTUAL
         ]);
-
-        // Add tracking for our holdings
-        this.holdings = new Set();
     }
 
     async start() {
@@ -152,6 +149,7 @@ class BaseMonitor {
         if (this.processedTxs.has(tx.hash)) return;
 
         try {
+            console.log(`[${this.CHAIN_NAME}] Analyzing transaction ${tx.hash} from ${wallet.label}`);
             const receipt = await this.provider.getTransactionReceipt(tx.hash);
             if (!receipt) return;
 
@@ -160,11 +158,19 @@ class BaseMonitor {
             
             // Check if wallet spent ETH
             const transaction = await this.provider.getTransaction(tx.hash);
+            console.log(`[${this.CHAIN_NAME}] Transaction value:`, {
+                from: transaction.from,
+                value: ethers.utils.formatEther(transaction.value),
+                to: transaction.to
+            });
+
             if (transaction.from.toLowerCase() === wallet.address.toLowerCase() && transaction.value.gt(0)) {
                 isRealPurchase = true;
+                console.log(`[${this.CHAIN_NAME}] Detected ETH spend:`, ethers.utils.formatEther(transaction.value));
             }
             
             // Check if wallet spent any tokens
+            console.log(`[${this.CHAIN_NAME}] Checking ${receipt.logs.length} logs for token transfers`);
             for (const log of receipt.logs) {
                 if (log.topics[0] !== ethers.utils.id("Transfer(address,address,uint256)")) continue;
                 
@@ -172,6 +178,7 @@ class BaseMonitor {
                 const from = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[1])[0].toLowerCase();
                 if (from === wallet.address.toLowerCase()) {
                     isRealPurchase = true;
+                    console.log(`[${this.CHAIN_NAME}] Detected token spend from wallet:`, log.address);
                     break;
                 }
             }
@@ -183,16 +190,26 @@ class BaseMonitor {
             }
 
             // Look for token transfers
+            console.log(`[${this.CHAIN_NAME}] Analyzing token transfers in transaction`);
             for (const log of receipt.logs) {
-                // Check if this is a Transfer event
                 if (log.topics[0] !== ethers.utils.id("Transfer(address,address,uint256)")) continue;
 
                 const tokenAddress = log.address.toLowerCase();
-                if (this.SKIP_TOKENS.has(tokenAddress)) continue;
+                if (this.SKIP_TOKENS.has(tokenAddress)) {
+                    console.log(`[${this.CHAIN_NAME}] Skipping ignored token:`, tokenAddress);
+                    continue;
+                }
 
-                // Get from/to addresses
                 const from = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[1])[0].toLowerCase();
                 const to = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[2])[0].toLowerCase();
+                const amount = ethers.utils.defaultAbiCoder.decode(['uint256'], log.data)[0];
+                
+                console.log(`[${this.CHAIN_NAME}] Token transfer:`, {
+                    token: tokenAddress,
+                    from,
+                    to,
+                    amount: amount.toString()
+                });
 
                 // If this is a sell from watched wallet, check if we hold the token
                 if (from === wallet.address.toLowerCase()) {
@@ -204,6 +221,7 @@ class BaseMonitor {
                         );
                         const balance = await tokenContract.balanceOf(this.traderWallet.address);
                         
+                        console.log(`[${this.CHAIN_NAME}] Our balance of ${tokenAddress}:`, balance.toString());
                         if (balance.gt(0)) {
                             await this.notifySell({
                                 tokenAddress,
@@ -219,29 +237,29 @@ class BaseMonitor {
 
             // Look for token purchases in logs
             const purchaseEvents = receipt.logs.filter(log => {
-                // Check if this is a Transfer event
                 const isTransfer = log.topics[0] === ethers.utils.id("Transfer(address,address,uint256)");
                 if (!isTransfer) return false;
 
-                // Get the recipient address from the topics
                 let toAddress;
                 if (log.topics.length === 3) {
-                    // For indexed parameters, the address is in the topic
                     toAddress = ethers.utils.defaultAbiCoder.decode(
                         ['address'],
                         ethers.utils.hexZeroPad(log.topics[2], 32)
                     )[0].toLowerCase();
                 }
 
-                // Check if this is a transfer to our watched wallet
                 return toAddress === wallet.address.toLowerCase();
             });
+
+            console.log(`[${this.CHAIN_NAME}] Found ${purchaseEvents.length} purchase events`);
 
             for (const event of purchaseEvents) {
                 const tokenAddress = event.address.toLowerCase();
                 
-                // Skip if token is in the skip list
-                if (this.SKIP_TOKENS.has(tokenAddress)) continue;
+                if (this.SKIP_TOKENS.has(tokenAddress)) {
+                    console.log(`[${this.CHAIN_NAME}] Skipping purchase of ignored token:`, tokenAddress);
+                    continue;
+                }
 
                 // Get token metadata
                 const tokenContract = new ethers.Contract(
@@ -256,9 +274,11 @@ class BaseMonitor {
                         tokenContract.symbol(),
                         tokenContract.name()
                     ]);
+                    console.log(`[${this.CHAIN_NAME}] Token info:`, { name, symbol, address: tokenAddress });
                 } catch (error) {
                     symbol = tokenAddress.slice(0, 6) + '...';
                     name = 'Unknown Token';
+                    console.log(`[${this.CHAIN_NAME}] Failed to get token info:`, error.message);
                 }
 
                 console.log(`[${this.CHAIN_NAME}] Purchase detected by ${wallet.label}:
@@ -285,6 +305,13 @@ class BaseMonitor {
 
         } catch (error) {
             console.error(`[${this.CHAIN_NAME}] Error analyzing transaction:`, error);
+            console.error('Transaction details:', {
+                hash: tx.hash,
+                from: tx.from,
+                to: tx.to,
+                error: error.message,
+                stack: error.stack
+            });
         }
     }
 
