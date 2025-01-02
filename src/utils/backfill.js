@@ -19,6 +19,14 @@ async function backfillHoldings(config, chain = 'all') {
 
                 console.log('Scanning holdings for address:', traderKey.toString());
 
+                // Check SOL balance first
+                const solBalance = await connection.getBalance(traderKey);
+                if (solBalance > 0) {
+                    const SOL_ADDRESS = 'So11111111111111111111111111111111111111112';
+                    await ledger.addHolding('solana', SOL_ADDRESS);
+                    console.log('Added native SOL to ledger');
+                }
+
                 const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
                     traderKey,
                     { programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') }
@@ -28,14 +36,18 @@ async function backfillHoldings(config, chain = 'all') {
                 
                 let addedCount = 0;
                 for (const account of tokenAccounts.value) {
-                    const tokenData = account.account.data.parsed.info;
-                    if (Number(tokenData.tokenAmount.amount) > 0) {
+                    // Log the full account structure to debug
+                    console.log('Token account:', JSON.stringify(account.account.data.parsed, null, 2));
+
+                    const tokenAmount = account.account.data.parsed.info.tokenAmount;
+                    if (tokenAmount && tokenAmount.uiAmount > 0) {
                         try {
-                            await ledger.addHolding('solana', tokenData.mint);
+                            const mint = account.account.data.parsed.info.mint;
+                            await ledger.addHolding('solana', mint);
                             addedCount++;
-                            console.log(`Added Solana holding: ${tokenData.mint}`);
+                            console.log(`Added Solana holding: ${mint} with amount ${tokenAmount.uiAmount}`);
                         } catch (error) {
-                            console.error(`Failed to add token ${tokenData.mint} to ledger:`, error);
+                            console.error(`Failed to add token to ledger:`, error);
                         }
                     }
                 }
@@ -118,4 +130,46 @@ async function backfillHoldings(config, chain = 'all') {
     }, 1000);
 }
 
-module.exports = { backfillHoldings }; 
+async function backfillSolanaHoldings(walletAddress) {
+    try {
+        console.log('Scanning holdings for address:', walletAddress);
+        
+        const connection = new Connection(process.env.SOLANA_RPC_URL);
+        const publicKey = new PublicKey(walletAddress);
+
+        // Check SOL balance first
+        const solBalance = await connection.getBalance(publicKey);
+        if (solBalance > 0) {
+            const SOL_ADDRESS = 'So11111111111111111111111111111111111111112';
+            await ledger.addHolding('solana', SOL_ADDRESS);
+            console.log('Added native SOL to ledger');
+        }
+
+        // Then check token accounts
+        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(publicKey, {
+            programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
+        });
+
+        console.log(`Found ${tokenAccounts.value.length} Solana token accounts`);
+        
+        let addedTokens = 0;
+        for (const account of tokenAccounts.value) {
+            const tokenBalance = account.account.data.parsed.info.tokenAmount;
+            if (tokenBalance.uiAmount > 0) {
+                const mint = account.account.data.parsed.info.mint;
+                await ledger.addHolding('solana', mint);
+                addedTokens++;
+            }
+        }
+
+        console.log(`Added ${addedTokens} Solana tokens to ledger`);
+
+    } catch (error) {
+        console.error('Error backfilling Solana holdings:', error);
+    }
+}
+
+module.exports = {
+    backfillHoldings,
+    backfillSolanaHoldings
+}; 

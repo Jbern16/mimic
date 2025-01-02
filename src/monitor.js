@@ -64,15 +64,10 @@ async function startMonitor(options) {
         if (options.telegramToken && options.telegramChat) {
             // Pass config to holdings service
             const holdings = require('./services/holdings');
-            console.log('Setting holdings config:', {
-                baseRpc: config.baseRpc,
-                baseZeroXApiKey: options.base0xKey,
-                baseTraderKey: config.baseTraderKey
-            });
-            holdings.setConfig({
-                ...config,
-                baseZeroXApiKey: options.base0xKey
-            });
+            const swapService = require('./services/swapService');
+            
+            holdings.setConfig(config);
+            swapService.setConfig(config);
             
             telegramService = new TelegramService(options.telegramToken, options.telegramChat);
             console.log('Telegram service started');

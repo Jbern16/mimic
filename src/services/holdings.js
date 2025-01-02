@@ -89,15 +89,33 @@ class HoldingsService {
     }
 
     async getSolanaMetadata(tokenAddress) {
+        // Handle native SOL
+        if (tokenAddress === 'So11111111111111111111111111111111111111112') {
+            return {
+                symbol: 'SOL',
+                name: 'Solana'
+            };
+        }
+
         const cacheKey = `solana:${tokenAddress}`;
         if (this.metadataCache.has(cacheKey)) {
             return this.metadataCache.get(cacheKey);
         }
 
         try {
-            // Try to get token metadata from token list first
-            const response = await axios.get('https://token.jup.ag/all');
-            const token = response.data.find(t => t.address === tokenAddress);
+            // Try strict list first, then fall back to full list
+            let token;
+            try {
+                const strictResponse = await axios.get('https://token.jup.ag/strict');
+                token = strictResponse.data.find(t => t.address === tokenAddress);
+            } catch (error) {
+                console.log('Failed to fetch strict token list, trying full list');
+            }
+
+            if (!token) {
+                const fullResponse = await axios.get('https://token.jup.ag/all');
+                token = fullResponse.data.find(t => t.address === tokenAddress);
+            }
             
             if (token) {
                 const metadata = {
@@ -108,14 +126,15 @@ class HoldingsService {
                 return metadata;
             }
 
+            // If token not found in either list, return shortened address
             return {
-                symbol: tokenAddress.slice(0, 6) + '...',
+                symbol: `${tokenAddress.slice(0, 4)}...${tokenAddress.slice(-4)}`,
                 name: 'Unknown Token'
             };
         } catch (error) {
             console.error(`Error fetching Solana token metadata for ${tokenAddress}:`, error);
             return {
-                symbol: tokenAddress.slice(0, 6) + '...',
+                symbol: `${tokenAddress.slice(0, 4)}...${tokenAddress.slice(-4)}`,
                 name: 'Unknown Token'
             };
         }
@@ -165,38 +184,32 @@ class HoldingsService {
     }
 
     async formatHoldingsMessage() {
-        if (!this.config) {
-            throw new Error('Config not set in HoldingsService');
-        }
-
         try {
-            const [solanaHoldings, baseHoldings] = await Promise.all([
-                ledger.getAllHoldings('solana'),
-                ledger.getAllHoldings('base')
-            ]);
+            let message = '*Current Holdings*\n';
 
-            let message = '📊 *Current Holdings*\n\n';
+            // Get holdings from ledger
+            const solanaHoldings = await ledger.getAllHoldings('solana');
+            const baseHoldings = await ledger.getAllHoldings('base');
 
-            // Add Solana holdings with metadata
-            message += '*SOLANA*\n';
+            // Add Solana holdings with metadata (no prices)
+            message += '\n*SOLANA*\n';
             if (solanaHoldings && solanaHoldings.length > 0) {
-                const metadataPromises = solanaHoldings.map(token => 
-                    this.getSolanaMetadata(token)
+                const SOL_ADDRESS = 'So11111111111111111111111111111111111111112';
+                const allSolanaHoldings = solanaHoldings.includes(SOL_ADDRESS) 
+                    ? solanaHoldings 
+                    : [SOL_ADDRESS, ...solanaHoldings];
+
+                // Get metadata for all tokens
+                const metadataResults = await Promise.all(
+                    allSolanaHoldings.map(token => this.getSolanaMetadata(token))
                 );
-                const metadataResults = await Promise.all(metadataPromises);
 
-                const validHoldings = solanaHoldings.map((token, index) => ({
-                    token,
-                    metadata: metadataResults[index]
-                })).filter(holding => holding.metadata.symbol);
-
-                if (validHoldings.length > 0) {
-                    validHoldings.forEach(({ metadata }) => {
-                        message += `• ${metadata.symbol}\n`;
-                    });
-                } else {
-                    message += '_No holdings_\n';
-                }
+                allSolanaHoldings.forEach((token, index) => {
+                    const metadata = metadataResults[index];
+                    // Escape dots in the shortened address
+                    const shortAddr = `${token.slice(0, 4)}\\.\\.\\.${token.slice(-4)}`;
+                    message += `• ${metadata.symbol} \\(${shortAddr}\\)\n`;
+                });
             } else {
                 message += '_No holdings_\n';
             }
@@ -244,6 +257,25 @@ class HoldingsService {
             console.error('Error formatting holdings message:', error);
             return '❌ Error retrieving holdings';
         }
+    }
+
+    async getTokenAddressFromSymbol(symbol) {
+        const baseHoldings = await ledger.getAllHoldings('base');
+        
+        // Handle ETH specially
+        if (symbol === 'ETH') {
+            return '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+        }
+
+        // Check each token's metadata to find matching symbol
+        for (const tokenAddress of baseHoldings) {
+            const metadata = await this.getBaseMetadata(tokenAddress);
+            if (metadata.symbol === symbol) {
+                return tokenAddress;
+            }
+        }
+
+        return null;
     }
 }
 
