@@ -24,6 +24,9 @@ class BaseMonitor {
             '0x0000000000000000000000000000000000000000'.toLowerCase(), // Native ETH
             '0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b'.toLowerCase(), // VIRTUAL
         ]);
+
+        // Add tracking for our holdings
+        this.holdings = new Set();
     }
 
     async start() {
@@ -152,6 +155,68 @@ class BaseMonitor {
             const receipt = await this.provider.getTransactionReceipt(tx.hash);
             if (!receipt) return;
 
+            // Check if this is a real purchase (wallet spent ETH or tokens)
+            let isRealPurchase = false;
+            
+            // Check if wallet spent ETH
+            const transaction = await this.provider.getTransaction(tx.hash);
+            if (transaction.from.toLowerCase() === wallet.address.toLowerCase() && transaction.value.gt(0)) {
+                isRealPurchase = true;
+            }
+            
+            // Check if wallet spent any tokens
+            for (const log of receipt.logs) {
+                if (log.topics[0] !== ethers.utils.id("Transfer(address,address,uint256)")) continue;
+                
+                // Check if wallet sent any tokens
+                const from = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[1])[0].toLowerCase();
+                if (from === wallet.address.toLowerCase()) {
+                    isRealPurchase = true;
+                    break;
+                }
+            }
+            
+            // If this isn't a real purchase, ignore incoming transfers
+            if (!isRealPurchase) {
+                console.log(`[${this.CHAIN_NAME}] Ignoring potential airdrop/disperse transaction: ${tx.hash}`);
+                return;
+            }
+
+            // Look for token transfers
+            for (const log of receipt.logs) {
+                // Check if this is a Transfer event
+                if (log.topics[0] !== ethers.utils.id("Transfer(address,address,uint256)")) continue;
+
+                const tokenAddress = log.address.toLowerCase();
+                if (this.SKIP_TOKENS.has(tokenAddress)) continue;
+
+                // Get from/to addresses
+                const from = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[1])[0].toLowerCase();
+                const to = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[2])[0].toLowerCase();
+
+                // If this is a sell from watched wallet, check if we hold the token
+                if (from === wallet.address.toLowerCase()) {
+                    try {
+                        const tokenContract = new ethers.Contract(
+                            tokenAddress,
+                            ['function balanceOf(address) view returns (uint256)'],
+                            this.provider
+                        );
+                        const balance = await tokenContract.balanceOf(this.traderWallet.address);
+                        
+                        if (balance.gt(0)) {
+                            await this.notifySell({
+                                tokenAddress,
+                                sourceWallet: wallet.label,
+                                txHash: tx.hash
+                            });
+                        }
+                    } catch (error) {
+                        console.error(`Error checking token balance:`, error);
+                    }
+                }
+            }
+
             // Look for token purchases in logs
             const purchaseEvents = receipt.logs.filter(log => {
                 // Check if this is a Transfer event
@@ -219,7 +284,39 @@ class BaseMonitor {
             }
 
         } catch (error) {
-            console.error(`[${this.CHAIN_NAME}] Error analyzing transaction for ${wallet.label}:`, error);
+            console.error(`[${this.CHAIN_NAME}] Error analyzing transaction:`, error);
+        }
+    }
+
+    async notifySell(sellInfo) {
+        try {
+            // Get token info
+            const tokenContract = new ethers.Contract(
+                sellInfo.tokenAddress,
+                ['function symbol() view returns (string)', 'function name() view returns (string)'],
+                this.provider
+            );
+
+            let symbol, name;
+            try {
+                [symbol, name] = await Promise.all([
+                    tokenContract.symbol(),
+                    tokenContract.name()
+                ]);
+            } catch (error) {
+                symbol = sellInfo.tokenAddress.slice(0, 6) + '...';
+                name = 'Unknown Token';
+            }
+
+            const message = `🔔 ${this.CHAIN_NAME} Sell Alert!\n\n` +
+                `*${sellInfo.sourceWallet}* is selling *${name} (${symbol})*\n` +
+                `You currently hold this token\n` +
+                `[View Transaction](https://basescan.org/tx/${sellInfo.txHash})`;
+
+            await this.sendTelegramMessage(message, true);
+
+        } catch (error) {
+            console.error(`[${this.CHAIN_NAME}] Error sending sell notification:`, error);
         }
     }
 
@@ -368,6 +465,7 @@ class BaseMonitor {
                         `*Execution Time:* ${executionTime}s`;
 
                     await this.sendTelegramMessage(successMessage, true);
+
                     return; // Success - exit the retry loop
 
                 } catch (error) {

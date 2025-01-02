@@ -101,6 +101,37 @@ class SolanaMonitor {
             // Track if we've already executed a copy trade for this transaction
             let copyTradeExecuted = false;
 
+            // Check for sells of tokens we hold
+            for (const preBalance of preTokenBalances) {
+                const tokenMint = preBalance.mint;
+                // Check if we currently hold this token
+                try {
+                    const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                        this.traderWallet.publicKey,
+                        { mint: new PublicKey(tokenMint) }
+                    );
+
+                    if (tokenAccounts.value.length > 0) {
+                        const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
+                        if (Number(balance.amount) > 0) {
+                            const postBalance = postTokenBalances.find(b => b.mint === tokenMint);
+                            const preBal = Number(preBalance.uiTokenAmount.amount);
+                            const postBal = postBalance ? Number(postBalance.uiTokenAmount.amount) : 0;
+
+                            if (postBal < preBal) {
+                                await this.notifySell({
+                                    tokenMint,
+                                    sourceWallet: wallet.label,
+                                    txSignature
+                                });
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Error checking token balance:`, error);
+                }
+            }
+
             // Look for token purchases (new tokens or balance increases)
             for (const postBalance of postTokenBalances) {
                 if (SKIP_TOKENS.has(postBalance.mint)) continue;
@@ -137,6 +168,20 @@ class SolanaMonitor {
 
         } catch (error) {
             console.error(`Error analyzing transaction for ${wallet.label}:`, error);
+        }
+    }
+
+    async notifySell(sellInfo) {
+        try {
+            const message = `🔔 ${this.CHAIN_NAME} Sell Alert!\n\n` +
+                `*${sellInfo.sourceWallet}* is selling *${sellInfo.tokenMint.slice(0, 8)}...*\n` +
+                `You currently hold this token\n` +
+                `[View Transaction](https://solscan.io/tx/${sellInfo.txSignature})`;
+
+            await this.sendTelegramMessage(message, true);
+
+        } catch (error) {
+            console.error(`[${this.CHAIN_NAME}] Error sending sell notification:`, error);
         }
     }
 
@@ -278,6 +323,7 @@ class SolanaMonitor {
                         `*Execution Time:* ${executionTime}s`;
                     
                     await this.sendTelegramMessage(successMessage, true);
+
                     return; // Success - exit the retry loop
 
                 } catch (error) {
