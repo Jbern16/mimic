@@ -12,6 +12,7 @@
     "skip-token:list": "node index.js skip-token list",
     "skip-token:remove": "node index.js skip-token remove",
     "holdings:backfill": "node index.js holdings backfill",
+    "holdings:clear": "node index.js holdings clear",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"
@@ -29,8 +30,9 @@
     "cross-fetch": "^4.0.0",
     "dotenv": "^16.3.1",
     "ethers": "^5.7.2",
+    "inquirer": "^8.2.5",
     "ioredis": "^5.3.2",
-    "inquirer": "^8.2.5"
+    "node-telegram-bot-api": "^0.66.0"
   },
   "devDependencies": {
     "@babel/core": "^7.26.0",

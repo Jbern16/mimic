@@ -13,7 +13,6 @@ async function backfillHoldings(config, chain = 'all') {
             if (config.solana?.enabled && config.solana?.rpc && process.env.SOLANA_TRADER_KEY) {
                 console.log('\nScanning Solana holdings...');
                 const connection = new Connection(config.solana.rpc);
-                // Decode base58 private key and create Keypair
                 const privateKeyBytes = bs58.decode(process.env.SOLANA_TRADER_KEY);
                 const traderKeypair = Keypair.fromSecretKey(privateKeyBytes);
                 const traderKey = traderKeypair.publicKey;
@@ -31,9 +30,8 @@ async function backfillHoldings(config, chain = 'all') {
                 for (const account of tokenAccounts.value) {
                     const tokenData = account.account.data.parsed.info;
                     if (Number(tokenData.tokenAmount.amount) > 0) {
-                        console.log(`Processing token ${tokenData.mint} with amount ${tokenData.tokenAmount.amount}`);
                         try {
-                            await ledger.addHolding('solana', tokenData.mint, tokenData.tokenAmount.amount);
+                            await ledger.addHolding('solana', tokenData.mint);
                             addedCount++;
                             console.log(`Added Solana holding: ${tokenData.mint}`);
                         } catch (error) {
@@ -42,10 +40,6 @@ async function backfillHoldings(config, chain = 'all') {
                     }
                 }
                 console.log(`Added ${addedCount} Solana tokens to ledger`);
-
-                // Verify the holdings were added
-                const holdings = await ledger.getAllHoldings('solana');
-                console.log('Current Solana holdings in ledger:', holdings);
             }
         }
 
@@ -53,12 +47,8 @@ async function backfillHoldings(config, chain = 'all') {
         if (chain === 'all' || chain === 'base') {
             if (config.base?.enabled && config.base?.rpc && process.env.BASE_TRADER_KEY) {
                 console.log('\nScanning Base holdings...');
-                // Convert WebSocket URL to HTTP
                 const httpRpc = config.base.rpc.replace('wss://', 'https://').replace('ws://', 'http://');
-                const provider = new ethers.providers.JsonRpcProvider(httpRpc, {
-                    name: 'base',
-                    chainId: 8453
-                });
+                const provider = new ethers.providers.JsonRpcProvider(httpRpc);
                 const wallet = new ethers.Wallet(process.env.BASE_TRADER_KEY, provider);
                 console.log('Scanning holdings for address:', wallet.address);
 
@@ -68,6 +58,7 @@ async function backfillHoldings(config, chain = 'all') {
 
                 let cursor = null;
                 const processedTokens = new Set();
+                let addedCount = 0;
 
                 do {
                     const url = `https://api.0x.org/trade-analytics/swap?` +
@@ -89,58 +80,18 @@ async function backfillHoldings(config, chain = 'all') {
                         if (trade.chainId === 8453 && // Base chain
                             trade.taker.toLowerCase() === wallet.address.toLowerCase()) {
                             
-                            // Check actual token balances
+                            // Add buy token to holdings if not processed
                             if (!processedTokens.has(trade.buyToken)) {
                                 try {
-                                    // Handle native ETH
-                                    if (trade.buyToken.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
-                                        const balance = await provider.getBalance(wallet.address);
-                                        if (balance.gt(0)) {
-                                            await ledger.addHolding('base', trade.buyToken, balance.toString());
-                                            console.log(`Added Base native ETH holding: ${balance.toString()}`);
-                                        }
-                                    } else {
-                                        const tokenContract = new ethers.Contract(
-                                            trade.buyToken,
-                                            ['function balanceOf(address) view returns (uint256)'],
-                                            provider
-                                        );
-                                        const balance = await tokenContract.balanceOf(wallet.address);
-                                        if (balance.gt(0)) {
-                                            await ledger.addHolding('base', trade.buyToken, balance.toString());
-                                            console.log(`Added Base holding from buy: ${trade.buyToken} (${balance.toString()})`);
-                                        }
+                                    // Skip native ETH
+                                    if (trade.buyToken.toLowerCase() !== '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
+                                        await ledger.addHolding('base', trade.buyToken);
+                                        addedCount++;
+                                        console.log(`Added Base holding: ${trade.buyToken}`);
                                     }
                                     processedTokens.add(trade.buyToken);
                                 } catch (error) {
-                                    console.warn(`Failed to check balance for token ${trade.buyToken}:`, error.message);
-                                }
-                            }
-
-                            if (!processedTokens.has(trade.sellToken)) {
-                                try {
-                                    // Handle native ETH
-                                    if (trade.sellToken.toLowerCase() === '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee') {
-                                        const balance = await provider.getBalance(wallet.address);
-                                        if (balance.gt(0)) {
-                                            await ledger.addHolding('base', trade.sellToken, balance.toString());
-                                            console.log(`Added Base native ETH holding: ${balance.toString()}`);
-                                        }
-                                    } else {
-                                        const tokenContract = new ethers.Contract(
-                                            trade.sellToken,
-                                            ['function balanceOf(address) view returns (uint256)'],
-                                            provider
-                                        );
-                                        const balance = await tokenContract.balanceOf(wallet.address);
-                                        if (balance.gt(0)) {
-                                            await ledger.addHolding('base', trade.sellToken, balance.toString());
-                                            console.log(`Added Base holding from sell: ${trade.sellToken} (${balance.toString()})`);
-                                        }
-                                    }
-                                    processedTokens.add(trade.sellToken);
-                                } catch (error) {
-                                    console.warn(`Failed to check balance for token ${trade.sellToken}:`, error.message);
+                                    console.warn(`Failed to add token ${trade.buyToken}:`, error.message);
                                 }
                             }
                         }
@@ -148,6 +99,8 @@ async function backfillHoldings(config, chain = 'all') {
 
                     cursor = nextCursor;
                 } while (cursor);
+
+                console.log(`Added ${addedCount} Base tokens to ledger`);
             }
         }
 

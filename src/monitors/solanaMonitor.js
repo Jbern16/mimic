@@ -312,19 +312,8 @@ class SolanaMonitor {
 
                     console.log('Transaction confirmed!');
 
-                    // Get the actual token balance after purchase
-                    const tokenAccount = await this.connection.getParsedTokenAccountsByOwner(
-                        this.traderWallet.publicKey,
-                        { mint: new PublicKey(purchaseInfo.tokenAddress) }
-                    );
-
-                    let tokenAmount = '0';
-                    if (tokenAccount.value.length > 0) {
-                        tokenAmount = tokenAccount.value[0].account.data.parsed.info.tokenAmount.amount;
-                    }
-
                     // Add to ledger on successful purchase
-                    await ledger.addHolding('solana', purchaseInfo.tokenAddress, tokenAmount);
+                    await ledger.addHolding('solana', purchaseInfo.tokenAddress);
 
                     const executionTime = ((Date.now() - startTime) / 1000).toFixed(2);
                     

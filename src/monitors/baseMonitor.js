@@ -145,8 +145,6 @@ class BaseMonitor {
             const receipt = await this.provider.getTransactionReceipt(tx.hash);
             if (!receipt) return;
 
-            // Track unique tokens we need to check
-            const tokensToCheck = new Set();
             
             // Check if this is a real purchase (wallet spent ETH or tokens)
             let isRealPurchase = false;
@@ -197,46 +195,15 @@ class BaseMonitor {
 
                 const from = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[1])[0].toLowerCase();
                 
-                // If this is a sell from watched wallet, add token to check list
+                // If this is a sell from watched wallet, check if we hold it
                 if (from === wallet.address.toLowerCase()) {
-                    tokensToCheck.add(tokenAddress);
-                }
-            }
-
-            // Batch check our balances for all tokens
-            if (tokensToCheck.size > 0) {
-                console.log(`[${this.CHAIN_NAME}] Checking balances for ${tokensToCheck.size} tokens`);
-                const multicallContract = new ethers.Contract(
-                    '0xcA11bde05977b3631167028862bE2a173976CA11', // Base Multicall3
-                    ['function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) view returns (tuple(bool success, bytes returnData)[] returnData)'],
-                    this.provider
-                );
-
-                const balanceOfAbi = ['function balanceOf(address) view returns (uint256)'];
-                const balanceOfInterface = new ethers.utils.Interface(balanceOfAbi);
-
-                const calls = Array.from(tokensToCheck).map(tokenAddress => ({
-                    target: tokenAddress,
-                    allowFailure: true,
-                    callData: balanceOfInterface.encodeFunctionData('balanceOf', [this.traderWallet.address])
-                }));
-
-                const results = await multicallContract.aggregate3(calls);
-
-                // Process results
-                const tokens = Array.from(tokensToCheck);
-                for (let i = 0; i < results.length; i++) {
-                    const { success, returnData } = results[i];
-                    if (success) {
-                        const balance = ethers.BigNumber.from(returnData);
-                        console.log(`[${this.CHAIN_NAME}] Our balance of ${tokens[i]}:`, balance.toString());
-                        if (balance.gt(0)) {
-                            await this.notifySell({
-                                tokenAddress: tokens[i],
-                                sourceWallet: wallet.label,
-                                txHash: tx.hash
-                            });
-                        }
+                    const hasHolding = await ledger.hasHolding('base', tokenAddress);
+                    if (hasHolding) {
+                        await this.notifySell({
+                            tokenAddress,
+                            sourceWallet: wallet.label,
+                            txHash: tx.hash
+                        });
                     }
                 }
             }
@@ -287,12 +254,6 @@ class BaseMonitor {
                     console.log(`[${this.CHAIN_NAME}] Failed to get token info:`, error.message);
                 }
 
-                console.log(`[${this.CHAIN_NAME}] Purchase detected by ${wallet.label}:
-                    Token: ${name} (${symbol})
-                    Address: ${tokenAddress}
-                    Transaction: ${tx.hash}
-                `);
-
                 this.processedTxs.add(tx.hash);
                 
                 await this.executeCopyTrade({
@@ -311,13 +272,6 @@ class BaseMonitor {
 
         } catch (error) {
             console.error(`[${this.CHAIN_NAME}] Error analyzing transaction:`, error);
-            console.error('Transaction details:', {
-                hash: tx.hash,
-                from: tx.from,
-                to: tx.to,
-                error: error.message,
-                stack: error.stack
-            });
         }
     }
 
@@ -360,21 +314,16 @@ class BaseMonitor {
 
         try {
             // Check if we already hold this token
-            const tokenContract = new ethers.Contract(
-                purchaseInfo.tokenAddress,
-                ['function balanceOf(address) view returns (uint256)'],
-                this.provider
-            );
-
-            try {
-                const hasHolding = await ledger.hasHolding('base', purchaseInfo.tokenAddress);
-                if (hasHolding) {
-                    console.log(`[${this.CHAIN_NAME}] Already holding ${purchaseInfo.symbol}, skipping purchase`);
-                    return;
-                }
-            } catch (error) {
-                console.error(`[${this.CHAIN_NAME}] Error checking token balance:`, error);
-                // Continue with trade if balance check fails
+            const hasHolding = await ledger.hasHolding('base', purchaseInfo.tokenAddress);
+            if (hasHolding) {
+                console.log(`[${this.CHAIN_NAME}] Already holding ${purchaseInfo.symbol}, skipping purchase`);
+                await this.sendTelegramMessage(
+                    `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                    `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.name} (${purchaseInfo.symbol})*\n` +
+                    `You already hold this token - Trade skipped`,
+                    true
+                );
+                return;
             }
 
             console.log(`[${this.CHAIN_NAME}] Starting copy trade for ${purchaseInfo.name} (${purchaseInfo.symbol}) - Following ${purchaseInfo.sourceWallet}`);
@@ -493,16 +442,8 @@ class BaseMonitor {
 
                     await this.sendTelegramMessage(successMessage, true);
 
-                    // Get the actual token balance after purchase
-                    const tokenContract = new ethers.Contract(
-                        purchaseInfo.tokenAddress,
-                        ['function balanceOf(address) view returns (uint256)'],
-                        this.provider
-                    );
-                    const balance = await tokenContract.balanceOf(this.traderWallet.address);
-
                     // Add to ledger on successful purchase
-                    await ledger.addHolding('base', purchaseInfo.tokenAddress, balance.toString());
+                    await ledger.addHolding('base', purchaseInfo.tokenAddress);
 
                     return; // Success - exit the retry loop
 
@@ -539,7 +480,10 @@ class BaseMonitor {
 
         } catch (error) {
             console.error(`[${this.CHAIN_NAME}] Error executing copy trade:`, error);
-            await this.sendTelegramMessage(`❌ ${this.CHAIN_NAME} Copy Trade Failed!\n\n*Token:* ${purchaseInfo.symbol}\n*Error:* ${error.message}`, true);
+            await this.sendTelegramMessage(
+                `❌ ${this.CHAIN_NAME} Copy Trade Failed!\n\n*Token:* ${purchaseInfo.name} (${purchaseInfo.symbol})\n*Error:* ${error.message}`,
+                true
+            );
         }
     }
 

@@ -7,6 +7,7 @@ const { setupConfig, addWallet } = require('./utils/setup');
 const { startMonitor } = require('./monitor');
 const { backfillHoldings } = require('./utils/backfill');
 const inquirer = require('inquirer');
+const ledger = require('./services/ledger');
 
 async function loadConfig(path) {
     try {
@@ -219,7 +220,28 @@ function createCLI() {
                             }
                         })
                 )
-                );
+                .addCommand(
+                    program
+                        .command('clear')
+                        .description('Clear all holdings from Redis')
+                        .option('-c, --chain <chain>', 'Chain to clear (solana/base/all)', 'all')
+                        .action(async (options) => {
+                            try {
+                                if (options.chain === 'all') {
+                                    await ledger.clearAllHoldings();
+                                    console.log('Cleared all holdings from Redis');
+                                } else {
+                                    await ledger.clearChainHoldings(options.chain);
+                                    console.log(`Cleared ${options.chain} holdings from Redis`);
+                                }
+                                process.exit(0);
+                            } catch (error) {
+                                console.error('Error clearing holdings:', error);
+                                process.exit(1);
+                            }
+                        })
+                )
+        );
         
 
     program.parse(process.argv);

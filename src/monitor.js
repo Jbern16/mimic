@@ -1,8 +1,11 @@
 const SolanaMonitor = require('./monitors/solanaMonitor');
 const BaseMonitor = require('./monitors/baseMonitor');
 const ledger = require('./services/ledger');
+const TelegramService = require('./services/telegram');
 
 async function startMonitor(options) {
+    let telegramService;
+
     try {
         // Initialize Redis connection
         console.log('\nConnecting to Redis...');
@@ -56,6 +59,24 @@ async function startMonitor(options) {
             slippageBps: options.slippage,
             skipTokens: options.skipTokens
         };
+
+        // Initialize Telegram service if configured
+        if (options.telegramToken && options.telegramChat) {
+            // Pass config to holdings service
+            const holdings = require('./services/holdings');
+            console.log('Setting holdings config:', {
+                baseRpc: config.baseRpc,
+                baseZeroXApiKey: options.base0xKey,
+                baseTraderKey: config.baseTraderKey
+            });
+            holdings.setConfig({
+                ...config,
+                baseZeroXApiKey: options.base0xKey
+            });
+            
+            telegramService = new TelegramService(options.telegramToken, options.telegramChat);
+            console.log('Telegram service started');
+        }
 
         // Log configured skip tokens
         console.log('\nConfigured Skip Tokens:');
@@ -117,6 +138,9 @@ async function startMonitor(options) {
     } catch (error) {
         console.error('Failed to start monitors:', error);
         await ledger.close();
+        if (telegramService) {
+            await telegramService.stop();
+        }
         process.exit(1);
     }
 
@@ -124,6 +148,9 @@ async function startMonitor(options) {
     process.on('SIGINT', async () => {
         console.log('\nShutting down...');
         await ledger.close();
+        if (telegramService) {
+            await telegramService.stop();
+        }
         process.exit(0);
     });
 }

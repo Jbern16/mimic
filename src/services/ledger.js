@@ -9,35 +9,41 @@ class Ledger {
         };
     }
 
-    async addHolding(chain, tokenAddress, amount) {
+    async addHolding(chain, tokenAddress) {
         const key = this.KEYS[`${chain.toUpperCase()}_HOLDINGS`];
-        await this.redis.hset(key, tokenAddress.toLowerCase(), amount.toString());
-    }
-
-    async getHolding(chain, tokenAddress) {
-        const key = this.KEYS[`${chain.toUpperCase()}_HOLDINGS`];
-        const amount = await this.redis.hget(key, tokenAddress.toLowerCase());
-        return amount ? amount.toString() : '0';
+        await this.redis.sadd(key, tokenAddress.toLowerCase());
     }
 
     async hasHolding(chain, tokenAddress) {
-        const amount = await this.getHolding(chain, tokenAddress);
-        return amount !== '0';
+        const key = this.KEYS[`${chain.toUpperCase()}_HOLDINGS`];
+        return await this.redis.sismember(key, tokenAddress.toLowerCase());
     }
 
     async getAllHoldings(chain) {
         const key = this.KEYS[`${chain.toUpperCase()}_HOLDINGS`];
-        return this.redis.hgetall(key);
+        return this.redis.smembers(key);
     }
 
     async removeHolding(chain, tokenAddress) {
         const key = this.KEYS[`${chain.toUpperCase()}_HOLDINGS`];
-        await this.redis.hdel(key, tokenAddress.toLowerCase());
+        await this.redis.srem(key, tokenAddress.toLowerCase());
     }
 
     async close() {
         await this.redis.quit();
     }
+
+    async clearAllHoldings() {
+        await Promise.all([
+            this.redis.del(this.KEYS.SOLANA_HOLDINGS),
+            this.redis.del(this.KEYS.BASE_HOLDINGS)
+        ]);
+    }
+
+    async clearChainHoldings(chain) {
+        const key = this.KEYS[`${chain.toUpperCase()}_HOLDINGS`];
+        await this.redis.del(key);
+    }
 }
 
-module.exports = new Ledger(); 
+module.exports = new Ledger();
