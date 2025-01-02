@@ -17,6 +17,7 @@ A configurable bot that monitors and copies trades from specified wallets on Sol
 
 - Node.js (v16 or higher)
 - npm or yarn
+- Redis server (running on localhost:6379 or configured via REDIS_URL)
 - Solana RPC endpoint (e.g., from Helius)
 - Base RPC endpoint (e.g., from QuickNode)
 - 0x API key (for Base chain)
@@ -33,6 +34,21 @@ A configurable bot that monitors and copies trades from specified wallets on Sol
 2. Install dependencies:
    ```bash
    npm install
+   ```
+
+3. Install and start Redis:
+   ```bash
+   # Ubuntu/Debian
+   sudo apt-get install redis-server
+   sudo systemctl start redis-server
+
+   # macOS with Homebrew
+   brew install redis
+   brew services start redis
+
+   # Verify Redis is running
+   redis-cli ping
+   # Should return "PONG"
    ```
 
 ## Configuration
@@ -118,6 +134,21 @@ Start the bot:
 npm start
 ```
 
+To stop both the bot and Redis:
+```bash
+npm run stop
+```
+
+### Redis Persistence
+Redis automatically persists data to disk, so your holdings will be preserved even if Redis or the bot is restarted. By default, Redis saves the dataset to disk:
+- Every 60 seconds if at least 1000 keys changed
+- Every 300 seconds if at least 100 keys changed
+- Every 900 seconds if at least 1 key changed
+
+You can find the Redis data files in:
+- Linux: `/var/lib/redis/dump.rdb`
+- macOS: `/usr/local/var/db/redis/dump.rdb`
+
 The bot will:
 1. Load configuration
 2. Connect to specified RPCs
@@ -130,6 +161,24 @@ The bot will:
 - `npm run setup` - Run interactive setup
 - `npm start` - Start the bot
 - `npm run wallet:add` - Add a wallet to monitor
+- `npm run holdings:backfill` - Scan wallets and populate Redis with current holdings
+
+### Backfilling Holdings
+
+To populate Redis with your current token holdings:
+```bash
+# Backfill all chains
+npm run holdings:backfill
+
+# Backfill specific chain
+npm run holdings:backfill -- -c solana
+npm run holdings:backfill -- -c base
+```
+
+This is useful when:
+- First setting up the bot
+- After Redis data loss
+- To verify/sync Redis with actual on-chain holdings
 
 ## Security Considerations
 
@@ -165,3 +214,58 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 MIT License
+
+## Managing Skip Tokens
+
+The bot maintains a list of tokens to ignore when copying trades. These are typically stablecoins, wrapped native tokens, or other tokens you don't want to trade.
+
+### Commands
+
+```bash
+# Add a token to skip list
+npm run skip-token:add -- -c solana -a ADDRESS -n "Description"
+npm run skip-token:add -- -c base -a ADDRESS -n "Description"
+
+# List all tokens being skipped
+npm run skip-token:list
+
+# Remove a token from skip list
+npm run skip-token:remove -- -c solana -a ADDRESS
+npm run skip-token:remove -- -c base -a ADDRESS
+```
+
+### Default Skip Tokens
+
+#### Solana
+- `So11111111111111111111111111111111111111112` (Native SOL)
+- `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (USDC)
+- `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` (USDC alternate)
+- `Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB` (USDT)
+- `DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263` (Bonk)
+- `mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So` (mSOL)
+- `DUSTawucrTsGU8hcqRdHDCbuYhCPADMLM2VcCb8VnFnQ` (DUST)
+
+#### Base
+- `0x4200000000000000000000000000000000000006` (WETH)
+- `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` (USDC)
+- `0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb` (USDT)
+- `0x0000000000000000000000000000000000000000` (Native ETH)
+- `0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b` (VIRTUAL)
+
+### Examples
+
+```bash
+# Add USDC on Solana to skip list
+npm run skip-token:add -- -c solana -a EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v -n "USDC"
+
+# Add WETH on Base to skip list
+npm run skip-token:add -- -c base -a 0x4200000000000000000000000000000000000006 -n "WETH"
+
+# View all skip tokens
+npm run skip-token:list
+
+# Remove a token from skip list
+npm run skip-token:remove -- -c base -a 0x4200000000000000000000000000000000000006
+```
+
+Skip tokens are stored in `config.json` under `general.skipTokens` and can also be edited manually if needed.

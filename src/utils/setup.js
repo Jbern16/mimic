@@ -89,6 +89,14 @@ const questions = [
         name: 'slippageBps',
         message: 'Enter slippage in basis points:',
         default: 300
+    },
+
+    // Redis Configuration
+    {
+        type: 'input',
+        name: 'redisUrl',
+        message: 'Enter Redis URL (default: redis://localhost:6379):',
+        default: 'redis://localhost:6379'
     }
 ];
 
@@ -128,7 +136,25 @@ async function setupConfig() {
         },
         general: {
             slippageBps: answers.slippageBps,
-            debug: false
+            debug: false,
+            skipTokens: {
+                solana: [
+                    'So11111111111111111111111111111111111111112', // Native SOL
+                    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+                    '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', // USDC (alternate)
+                    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+                    'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // Bonk
+                    'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // mSOL
+                    'DUSTawucrTsGU8hcqRdHDCbuYhCPADMLM2VcCb8VnFnQ'  // DUST
+                ],
+                base: [
+                    '0x4200000000000000000000000000000000000006', // WETH
+                    '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC
+                    '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', // USDT
+                    '0x0000000000000000000000000000000000000000', // Native ETH
+                    '0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b'  // VIRTUAL
+                ]
+            }
         }
     };
 

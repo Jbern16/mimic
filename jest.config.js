@@ -1,8 +1,7 @@
 module.exports = {
   testEnvironment: 'node',
-  testMatch: ['**/__tests__/**/*.js', '**/?(*.)+(spec|test).js'],
-  moduleDirectories: ['node_modules', 'src'],
-  transform: {
-    '^.+\\.js$': 'babel-jest',
-  },
+  testMatch: ['**/__tests__/**/*.test.js'],
+  collectCoverage: true,
+  coverageDirectory: 'coverage',
+  coveragePathIgnorePatterns: ['/node_modules/']
 }; 

@@ -1,8 +1,39 @@
 const SolanaMonitor = require('./monitors/solanaMonitor');
 const BaseMonitor = require('./monitors/baseMonitor');
+const ledger = require('./services/ledger');
 
 async function startMonitor(options) {
     try {
+        // Initialize Redis connection
+        console.log('\nConnecting to Redis...');
+        try {
+            // Test Redis connection by setting and getting a value
+            await ledger.redis.set('test', 'connection');
+            const test = await ledger.redis.get('test');
+            if (test !== 'connection') {
+                throw new Error('Redis connection test failed');
+            }
+            console.log('Redis connected successfully!');
+
+            // Log current holdings
+            console.log('\nCurrent Holdings:');
+            const solanaHoldings = await ledger.getAllHoldings('solana');
+            const baseHoldings = await ledger.getAllHoldings('base');
+            
+            console.log('\nSOLANA:');
+            Object.entries(solanaHoldings || {}).forEach(([token, amount]) => {
+                console.log(`  ${token}: ${amount}`);
+            });
+
+            console.log('\nBASE:');
+            Object.entries(baseHoldings || {}).forEach(([token, amount]) => {
+                console.log(`  ${token}: ${amount}`);
+            });
+        } catch (error) {
+            console.error('Failed to connect to Redis:', error);
+            process.exit(1);
+        }
+
         // Configuration from CLI options
         const config = {
             // Solana config
@@ -22,8 +53,18 @@ async function startMonitor(options) {
             // Common config
             telegramToken: options.telegramToken,
             telegramChatId: options.telegramChat,
-            slippageBps: options.slippage
+            slippageBps: options.slippage,
+            skipTokens: options.skipTokens
         };
+
+        // Log configured skip tokens
+        console.log('\nConfigured Skip Tokens:');
+        if (config.skipTokens) {
+            for (const [chain, tokens] of Object.entries(config.skipTokens)) {
+                console.log(`\n${chain.toUpperCase()}:`);
+                tokens.forEach(token => console.log(`  ${token}`));
+            }
+        }
 
         // Start Solana Monitor if enabled and configured
         if (options.enableSolana && config.solanaWallets) {
@@ -32,7 +73,8 @@ async function startMonitor(options) {
             const solanaTradeConfig = {
                 amountInSol: config.solanaTradeAmount,
                 amountInLamports: Math.floor(config.solanaTradeAmount * 1e9),
-                slippageBps: config.slippageBps
+                slippageBps: config.slippageBps,
+                SKIP_TOKENS: new Set(config.skipTokens?.solana || [])
             };
 
             const solanaMonitor = new SolanaMonitor(
@@ -55,7 +97,8 @@ async function startMonitor(options) {
             
             const baseTradeConfig = {
                 amountInETH: config.baseTradeAmount.toString(),
-                slippageBps: config.slippageBps
+                slippageBps: config.slippageBps,
+                SKIP_TOKENS: new Set((config.skipTokens?.base || []).map(addr => addr.toLowerCase()))
             };
 
             const baseMonitor = new BaseMonitor(
@@ -73,8 +116,16 @@ async function startMonitor(options) {
 
     } catch (error) {
         console.error('Failed to start monitors:', error);
+        await ledger.close();
         process.exit(1);
     }
+
+    // Handle graceful shutdown
+    process.on('SIGINT', async () => {
+        console.log('\nShutting down...');
+        await ledger.close();
+        process.exit(0);
+    });
 }
 
 module.exports = { startMonitor }; 

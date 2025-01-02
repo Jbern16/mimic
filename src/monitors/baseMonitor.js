@@ -1,5 +1,6 @@
 const ethers = require('ethers');
 const axios = require('axios');
+const ledger = require('../services/ledger');
 
 class BaseMonitor {
     constructor(rpcEndpoint, wallets, telegramToken, telegramChatId, tradeConfig) {
@@ -15,15 +16,6 @@ class BaseMonitor {
         this.ZERO_X_API = 'https://api.0x.org';
         this.ZERO_X_API_KEY = process.env.BASE_ZERO_X_API_KEY;
         this.CHAIN_ID = 8453; // Base chain ID
-        
-        // Common tokens to ignore
-        this.SKIP_TOKENS = new Set([
-            '0x4200000000000000000000000000000000000006'.toLowerCase(), // WETH
-            '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'.toLowerCase(), // USDC
-            '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb'.toLowerCase(), // USDT
-            '0x0000000000000000000000000000000000000000'.toLowerCase(), // Native ETH
-            '0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b'.toLowerCase(), // VIRTUAL
-        ]);
     }
 
     async start() {
@@ -153,6 +145,9 @@ class BaseMonitor {
             const receipt = await this.provider.getTransactionReceipt(tx.hash);
             if (!receipt) return;
 
+            // Track unique tokens we need to check
+            const tokensToCheck = new Set();
+            
             // Check if this is a real purchase (wallet spent ETH or tokens)
             let isRealPurchase = false;
             
@@ -195,42 +190,53 @@ class BaseMonitor {
                 if (log.topics[0] !== ethers.utils.id("Transfer(address,address,uint256)")) continue;
 
                 const tokenAddress = log.address.toLowerCase();
-                if (this.SKIP_TOKENS.has(tokenAddress)) {
+                if (this.tradeConfig.SKIP_TOKENS.has(tokenAddress)) {
                     console.log(`[${this.CHAIN_NAME}] Skipping ignored token:`, tokenAddress);
                     continue;
                 }
 
                 const from = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[1])[0].toLowerCase();
-                const to = ethers.utils.defaultAbiCoder.decode(['address'], log.topics[2])[0].toLowerCase();
-                const amount = ethers.utils.defaultAbiCoder.decode(['uint256'], log.data)[0];
                 
-                console.log(`[${this.CHAIN_NAME}] Token transfer:`, {
-                    token: tokenAddress,
-                    from,
-                    to,
-                    amount: amount.toString()
-                });
-
-                // If this is a sell from watched wallet, check if we hold the token
+                // If this is a sell from watched wallet, add token to check list
                 if (from === wallet.address.toLowerCase()) {
-                    try {
-                        const tokenContract = new ethers.Contract(
-                            tokenAddress,
-                            ['function balanceOf(address) view returns (uint256)'],
-                            this.provider
-                        );
-                        const balance = await tokenContract.balanceOf(this.traderWallet.address);
-                        
-                        console.log(`[${this.CHAIN_NAME}] Our balance of ${tokenAddress}:`, balance.toString());
+                    tokensToCheck.add(tokenAddress);
+                }
+            }
+
+            // Batch check our balances for all tokens
+            if (tokensToCheck.size > 0) {
+                console.log(`[${this.CHAIN_NAME}] Checking balances for ${tokensToCheck.size} tokens`);
+                const multicallContract = new ethers.Contract(
+                    '0xcA11bde05977b3631167028862bE2a173976CA11', // Base Multicall3
+                    ['function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) view returns (tuple(bool success, bytes returnData)[] returnData)'],
+                    this.provider
+                );
+
+                const balanceOfAbi = ['function balanceOf(address) view returns (uint256)'];
+                const balanceOfInterface = new ethers.utils.Interface(balanceOfAbi);
+
+                const calls = Array.from(tokensToCheck).map(tokenAddress => ({
+                    target: tokenAddress,
+                    allowFailure: true,
+                    callData: balanceOfInterface.encodeFunctionData('balanceOf', [this.traderWallet.address])
+                }));
+
+                const results = await multicallContract.aggregate3(calls);
+
+                // Process results
+                const tokens = Array.from(tokensToCheck);
+                for (let i = 0; i < results.length; i++) {
+                    const { success, returnData } = results[i];
+                    if (success) {
+                        const balance = ethers.BigNumber.from(returnData);
+                        console.log(`[${this.CHAIN_NAME}] Our balance of ${tokens[i]}:`, balance.toString());
                         if (balance.gt(0)) {
                             await this.notifySell({
-                                tokenAddress,
+                                tokenAddress: tokens[i],
                                 sourceWallet: wallet.label,
                                 txHash: tx.hash
                             });
                         }
-                    } catch (error) {
-                        console.error(`Error checking token balance:`, error);
                     }
                 }
             }
@@ -256,7 +262,7 @@ class BaseMonitor {
             for (const event of purchaseEvents) {
                 const tokenAddress = event.address.toLowerCase();
                 
-                if (this.SKIP_TOKENS.has(tokenAddress)) {
+                if (this.tradeConfig.SKIP_TOKENS.has(tokenAddress)) {
                     console.log(`[${this.CHAIN_NAME}] Skipping purchase of ignored token:`, tokenAddress);
                     continue;
                 }
@@ -361,15 +367,9 @@ class BaseMonitor {
             );
 
             try {
-                const balance = await tokenContract.balanceOf(this.traderWallet.address);
-                if (balance.gt(0)) {
+                const hasHolding = await ledger.hasHolding('base', purchaseInfo.tokenAddress);
+                if (hasHolding) {
                     console.log(`[${this.CHAIN_NAME}] Already holding ${purchaseInfo.symbol}, skipping purchase`);
-                    await this.sendTelegramMessage(
-                        `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
-                        `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.name} (${purchaseInfo.symbol})*\n` +
-                        `You already hold this token - Trade skipped`,
-                        true
-                    );
                     return;
                 }
             } catch (error) {
@@ -492,6 +492,9 @@ class BaseMonitor {
                         `*Execution Time:* ${executionTime}s`;
 
                     await this.sendTelegramMessage(successMessage, true);
+
+                    // Add to ledger on successful purchase
+                    await ledger.addHolding('base', purchaseInfo.tokenAddress, '1');
 
                     return; // Success - exit the retry loop
 

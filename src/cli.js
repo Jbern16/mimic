@@ -5,6 +5,8 @@ const path = require('path');
 require('dotenv').config();
 const { setupConfig, addWallet } = require('./utils/setup');
 const { startMonitor } = require('./monitor');
+const { backfillHoldings } = require('./utils/backfill');
+const inquirer = require('inquirer');
 
 async function loadConfig(path) {
     try {
@@ -68,6 +70,158 @@ function createCLI() {
         .description('Add a new wallet to watch')
         .action(addWallet);
 
+    program
+        .command('skip-token')
+        .description('Manage tokens to skip/ignore when copying trades')
+        .addCommand(
+            program
+                .command('add')
+                .description('Add a token to the skip list')
+                .option('-c, --chain <chain>', 'Chain (solana/base)')
+                .option('-a, --address <address>', 'Token address')
+                .option('-n, --name <name>', 'Token name/description')
+                .action(async (options) => {
+                    try {
+                        const configPath = path.join(process.cwd(), 'config.json');
+                        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                        
+                        if (!options.chain || !options.address) {
+                            const answers = await inquirer.prompt([
+                                {
+                                    type: 'list',
+                                    name: 'chain',
+                                    message: 'Select chain:',
+                                    choices: ['solana', 'base'],
+                                    when: !options.chain
+                                },
+                                {
+                                    type: 'input',
+                                    name: 'address',
+                                    message: 'Enter token address to skip:',
+                                    when: !options.address
+                                },
+                                {
+                                    type: 'input',
+                                    name: 'name',
+                                    message: 'Enter token description (optional):',
+                                    when: !options.name
+                                }
+                            ]);
+                            
+                            options = { ...options, ...answers };
+                        }
+                        
+                        const chain = options.chain.toLowerCase();
+                        const address = chain === 'base' ? options.address.toLowerCase() : options.address;
+                        const comment = options.name ? ` // ${options.name}` : '';
+                        
+                        if (!config.general.skipTokens[chain]) {
+                            config.general.skipTokens[chain] = [];
+                        }
+                        
+                        if (!config.general.skipTokens[chain].includes(address)) {
+                            config.general.skipTokens[chain].push(address + comment);
+                            fs.writeFileSync(configPath, JSON.stringify(config, null, 4));
+                            console.log(`Added ${address} to ${chain} skip tokens list`);
+                        } else {
+                            console.log(`Token ${address} already in skip list`);
+                        }
+                    } catch (error) {
+                        console.error('Error adding skip token:', error);
+                    }
+                })
+        )
+        .addCommand(
+            program
+                .command('list')
+                .description('List all tokens being skipped')
+                .action(() => {
+                    try {
+                        const configPath = path.join(process.cwd(), 'config.json');
+                        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                        
+                        console.log('\nTokens Being Skipped:');
+                        for (const [chain, tokens] of Object.entries(config.general.skipTokens)) {
+                            console.log(`\n${chain.toUpperCase()}:`);
+                            tokens.forEach(token => console.log(`  ${token}`));
+                        }
+                    } catch (error) {
+                        console.error('Error listing skip tokens:', error);
+                    }
+                })
+        )
+        .addCommand(
+            program
+                .command('remove')
+                .description('Remove a token from skip list')
+                .option('-c, --chain <chain>', 'Chain (solana/base)')
+                .option('-a, --address <address>', 'Token address')
+                .action(async (options) => {
+                    try {
+                        const configPath = path.join(process.cwd(), 'config.json');
+                        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                        
+                        if (!options.chain || !options.address) {
+                            const answers = await inquirer.prompt([
+                                {
+                                    type: 'list',
+                                    name: 'chain',
+                                    message: 'Select chain:',
+                                    choices: ['solana', 'base'],
+                                    when: !options.chain
+                                },
+                                {
+                                    type: 'input',
+                                    name: 'address',
+                                    message: 'Enter token address to remove from skip list:',
+                                    when: !options.address
+                                }
+                            ]);
+                            
+                            options = { ...options, ...answers };
+                        }
+                        
+                        const chain = options.chain.toLowerCase();
+                        const address = chain === 'base' ? options.address.toLowerCase() : options.address;
+                        
+                        if (config.general.skipTokens[chain]) {
+                            const index = config.general.skipTokens[chain].findIndex(t => t.split(' ')[0] === address);
+                            if (index !== -1) {
+                                config.general.skipTokens[chain].splice(index, 1);
+                                fs.writeFileSync(configPath, JSON.stringify(config, null, 4));
+                                console.log(`Removed ${address} from ${chain} skip tokens list`);
+                            } else {
+                                console.log(`Token ${address} not found in skip list`);
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error removing skip token:', error);
+                    }
+                })
+        )
+        .addCommand(
+            program
+                .command('holdings')
+                .description('Holdings management commands')
+                .addCommand(
+                    program
+                        .command('backfill')
+                        .description('Scan wallets and populate Redis with current holdings')
+                        .option('-c, --chain <chain>', 'Chain to backfill (solana/base/all)', 'all')
+                        .action(async (options) => {
+                            try {
+                                const configPath = path.join(process.cwd(), 'config.json');
+                                const config = await loadConfig(configPath);
+                                await backfillHoldings(config, options.chain);
+                            } catch (error) {
+                                console.error('Error backfilling holdings:', error);
+                                process.exit(1);
+                            }
+                        })
+                )
+                );
+        
+
     program.parse(process.argv);
     return program;
 }
@@ -97,7 +251,8 @@ async function parseConfig(configPath) {
         telegramToken: config.telegram?.botToken,
         telegramChat: config.telegram?.chatId,
         slippage: config.general?.slippageBps,
-        debug: config.general?.debug
+        debug: config.general?.debug,
+        skipTokens: config.general?.skipTokens
     };
 }
 

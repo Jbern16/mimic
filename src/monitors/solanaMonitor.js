@@ -2,6 +2,7 @@ const { Connection, PublicKey, Keypair, VersionedTransaction } = require('@solan
 const fetch = require('cross-fetch');
 const axios = require('axios');
 const bs58 = require('bs58');
+const ledger = require('../services/ledger');
 
 class SolanaMonitor {
     constructor(rpcEndpoint, wsEndpoint, wallets, telegramToken, telegramChatId, tradeConfig) {
@@ -110,7 +111,7 @@ class SolanaMonitor {
             for (const postBalance of postTokenBalances) {
                 console.log(`[${this.CHAIN_NAME}] Checking token: ${postBalance.mint}`);
                 
-                if (SKIP_TOKENS.has(postBalance.mint)) {
+                if (this.tradeConfig.SKIP_TOKENS.has(postBalance.mint)) {
                     console.log(`[${this.CHAIN_NAME}] Skipping ignored token: ${postBalance.mint}`);
                     continue;
                 }
@@ -197,27 +198,16 @@ class SolanaMonitor {
             }
 
             // Check if we already hold this token
-            try {
-                const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
-                    this.traderWallet.publicKey,
-                    { mint: new PublicKey(purchaseInfo.tokenAddress) }
+            const hasHolding = await ledger.hasHolding('solana', purchaseInfo.tokenAddress);
+            if (hasHolding) {
+                console.log(`[${this.CHAIN_NAME}] Already holding token ${purchaseInfo.tokenAddress}, skipping purchase`);
+                await this.sendTelegramMessage(
+                    `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                    `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.symbol}*\n` +
+                    `You already hold this token - Trade skipped`,
+                    true
                 );
-
-                if (tokenAccounts.value.length > 0) {
-                    const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
-                    if (Number(balance.amount) > 0) {
-                        console.log(`[${this.CHAIN_NAME}] Already holding ${purchaseInfo.symbol}, skipping purchase`);
-                        await this.sendTelegramMessage(
-                            `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
-                            `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.symbol}*\n` +
-                            `You already hold this token - Trade skipped`,
-                            true
-                        );
-                        return;
-                    }
-                }
-            } catch (error) {
-                console.error(`[${this.CHAIN_NAME}] Error checking token balance:`, error);
+                return;
             }
 
             // Check wallet balance
@@ -322,6 +312,9 @@ class SolanaMonitor {
                         `*Execution Time:* ${executionTime}s`;
                     
                     await this.sendTelegramMessage(successMessage, true);
+
+                    // Add to ledger on successful purchase
+                    await ledger.addHolding('solana', purchaseInfo.tokenAddress, '1');
 
                     return; // Success - exit the retry loop
 
