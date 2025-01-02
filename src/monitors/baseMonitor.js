@@ -493,8 +493,16 @@ class BaseMonitor {
 
                     await this.sendTelegramMessage(successMessage, true);
 
+                    // Get the actual token balance after purchase
+                    const tokenContract = new ethers.Contract(
+                        purchaseInfo.tokenAddress,
+                        ['function balanceOf(address) view returns (uint256)'],
+                        this.provider
+                    );
+                    const balance = await tokenContract.balanceOf(this.traderWallet.address);
+
                     // Add to ledger on successful purchase
-                    await ledger.addHolding('base', purchaseInfo.tokenAddress, '1');
+                    await ledger.addHolding('base', purchaseInfo.tokenAddress, balance.toString());
 
                     return; // Success - exit the retry loop
 

@@ -2,7 +2,6 @@ const { Connection, PublicKey, Keypair, VersionedTransaction } = require('@solan
 const fetch = require('cross-fetch');
 const axios = require('axios');
 const bs58 = require('bs58');
-const ledger = require('../services/ledger');
 
 class SolanaMonitor {
     constructor(rpcEndpoint, wsEndpoint, wallets, telegramToken, telegramChatId, tradeConfig) {
@@ -80,12 +79,7 @@ class SolanaMonitor {
 
         try {
             const txSignature = transaction.transaction.signatures[0];
-            console.log(`[${this.CHAIN_NAME}] Analyzing transaction ${txSignature} from ${wallet.label}`);
-            
-            if (this.processedTxs.has(txSignature)) {
-                console.log(`[${this.CHAIN_NAME}] Skipping already processed transaction: ${txSignature}`);
-                return;
-            }
+            if (this.processedTxs.has(txSignature)) return;
 
             // Add transaction to processed set immediately to prevent duplicate processing
             this.processedTxs.add(txSignature);
@@ -93,38 +87,58 @@ class SolanaMonitor {
             const postTokenBalances = transaction.meta.postTokenBalances || [];
             const preTokenBalances = transaction.meta.preTokenBalances || [];
 
-            console.log(`[${this.CHAIN_NAME}] Pre-token balances:`, preTokenBalances.map(b => ({
-                mint: b.mint,
-                amount: b.uiTokenAmount.amount,
-                decimals: b.uiTokenAmount.decimals
-            })));
-            console.log(`[${this.CHAIN_NAME}] Post-token balances:`, postTokenBalances.map(b => ({
-                mint: b.mint,
-                amount: b.uiTokenAmount.amount,
-                decimals: b.uiTokenAmount.decimals
-            })));
+            // Define tokens to skip
+            const SKIP_TOKENS = new Set([
+                'So11111111111111111111111111111111111111112', // Native SOL
+                'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+                '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', // USDC (alternate)
+                'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+                'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // Bonk
+                'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // mSOL
+                'DUSTawucrTsGU8hcqRdHDCbuYhCPADMLM2VcCb8VnFnQ', // DUST
+            ]);
 
             // Track if we've already executed a copy trade for this transaction
             let copyTradeExecuted = false;
 
+            // Check for sells of tokens we hold
+            for (const preBalance of preTokenBalances) {
+                const tokenMint = preBalance.mint;
+                // Check if we currently hold this token
+                try {
+                    const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                        this.traderWallet.publicKey,
+                        { mint: new PublicKey(tokenMint) }
+                    );
+
+                    if (tokenAccounts.value.length > 0) {
+                        const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
+                        if (Number(balance.amount) > 0) {
+                            const postBalance = postTokenBalances.find(b => b.mint === tokenMint);
+                            const preBal = Number(preBalance.uiTokenAmount.amount);
+                            const postBal = postBalance ? Number(postBalance.uiTokenAmount.amount) : 0;
+
+                            if (postBal < preBal) {
+                                await this.notifySell({
+                                    tokenMint,
+                                    sourceWallet: wallet.label,
+                                    txSignature
+                                });
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Error checking token balance:`, error);
+                }
+            }
+
             // Look for token purchases (new tokens or balance increases)
             for (const postBalance of postTokenBalances) {
-                console.log(`[${this.CHAIN_NAME}] Checking token: ${postBalance.mint}`);
-                
-                if (this.tradeConfig.SKIP_TOKENS.has(postBalance.mint)) {
-                    console.log(`[${this.CHAIN_NAME}] Skipping ignored token: ${postBalance.mint}`);
-                    continue;
-                }
+                if (SKIP_TOKENS.has(postBalance.mint)) continue;
 
                 const preBalance = preTokenBalances.find(b => b.mint === postBalance.mint);
                 const preBal = preBalance ? Number(preBalance.uiTokenAmount.amount) : 0;
                 const postBal = Number(postBalance.uiTokenAmount.amount);
-
-                console.log(`[${this.CHAIN_NAME}] Balance change for ${postBalance.mint}:`, {
-                    pre: preBal,
-                    post: postBal,
-                    change: postBal - preBal
-                });
 
                 if (postBal > preBal && !copyTradeExecuted) {
                     const balanceIncrease = postBal - preBal;
@@ -141,17 +155,9 @@ class SolanaMonitor {
                         sourceWallet: wallet.label
                     });
 
+                    // Mark that we've executed a copy trade for this transaction
                     copyTradeExecuted = true;
-                } else {
-                    console.log(`[${this.CHAIN_NAME}] No purchase detected:`, {
-                        balanceIncreased: postBal > preBal,
-                        alreadyExecuted: copyTradeExecuted
-                    });
                 }
-            }
-
-            if (postTokenBalances.length === 0) {
-                console.log(`[${this.CHAIN_NAME}] No token balances found in transaction`);
             }
 
             // Clean up old transactions from the Set (keep last 1000)
@@ -162,12 +168,6 @@ class SolanaMonitor {
 
         } catch (error) {
             console.error(`Error analyzing transaction for ${wallet.label}:`, error);
-            console.error('Transaction details:', {
-                signature: transaction.transaction.signatures[0],
-                accounts: transaction.transaction.message.accountKeys.map(key => key.toString()),
-                error: error.message,
-                stack: error.stack
-            });
         }
     }
 
@@ -198,16 +198,27 @@ class SolanaMonitor {
             }
 
             // Check if we already hold this token
-            const hasHolding = await ledger.hasHolding('solana', purchaseInfo.tokenAddress);
-            if (hasHolding) {
-                console.log(`[${this.CHAIN_NAME}] Already holding token ${purchaseInfo.tokenAddress}, skipping purchase`);
-                await this.sendTelegramMessage(
-                    `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
-                    `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.symbol}*\n` +
-                    `You already hold this token - Trade skipped`,
-                    true
+            try {
+                const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                    this.traderWallet.publicKey,
+                    { mint: new PublicKey(purchaseInfo.tokenAddress) }
                 );
-                return;
+
+                if (tokenAccounts.value.length > 0) {
+                    const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
+                    if (Number(balance.amount) > 0) {
+                        console.log(`[${this.CHAIN_NAME}] Already holding ${purchaseInfo.symbol}, skipping purchase`);
+                        await this.sendTelegramMessage(
+                            `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                            `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.symbol}*\n` +
+                            `You already hold this token - Trade skipped`,
+                            true
+                        );
+                        return;
+                    }
+                }
+            } catch (error) {
+                console.error(`[${this.CHAIN_NAME}] Error checking token balance:`, error);
             }
 
             // Check wallet balance
@@ -301,6 +312,20 @@ class SolanaMonitor {
 
                     console.log('Transaction confirmed!');
 
+                    // Get the actual token balance after purchase
+                    const tokenAccount = await this.connection.getParsedTokenAccountsByOwner(
+                        this.traderWallet.publicKey,
+                        { mint: new PublicKey(purchaseInfo.tokenAddress) }
+                    );
+
+                    let tokenAmount = '0';
+                    if (tokenAccount.value.length > 0) {
+                        tokenAmount = tokenAccount.value[0].account.data.parsed.info.tokenAmount.amount;
+                    }
+
+                    // Add to ledger on successful purchase
+                    await ledger.addHolding('solana', purchaseInfo.tokenAddress, tokenAmount);
+
                     const executionTime = ((Date.now() - startTime) / 1000).toFixed(2);
                     
                     const successMessage = `✅ ${this.CHAIN_NAME} Copy Trade Executed!\n\n` +
@@ -312,9 +337,6 @@ class SolanaMonitor {
                         `*Execution Time:* ${executionTime}s`;
                     
                     await this.sendTelegramMessage(successMessage, true);
-
-                    // Add to ledger on successful purchase
-                    await ledger.addHolding('solana', purchaseInfo.tokenAddress, '1');
 
                     return; // Success - exit the retry loop
 
