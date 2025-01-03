@@ -2,6 +2,7 @@ const { Connection, PublicKey, Keypair, VersionedTransaction } = require('@solan
 const fetch = require('cross-fetch');
 const axios = require('axios');
 const bs58 = require('bs58');
+const ledger = require('../services/ledger');
 
 class SolanaMonitor {
     constructor(rpcEndpoint, wsEndpoint, wallets, telegramToken, telegramChatId, tradeConfig) {
@@ -45,129 +46,109 @@ class SolanaMonitor {
     }
 
     async handleLogs(logs) {
-        if (!logs?.signature) return;
-
         try {
-            const transaction = await this.connection.getTransaction(logs.signature, {
-                maxSupportedTransactionVersion: 0,
-                commitment: 'confirmed'
+            const signature = logs.signature;
+            
+            // Skip if we've already processed this tx
+            if (this.processedTxs.has(signature)) {
+                return;
+            }
+            this.processedTxs.add(signature);
+
+            // Get transaction details
+            const tx = await this.connection.getTransaction(signature, {
+                maxSupportedTransactionVersion: 0
             });
 
-            if (!transaction?.meta) return;
+            if (!tx) {
+                console.log(`[${this.CHAIN_NAME}] Transaction not found:`, signature);
+                return;
+            }
 
-            // For versioned transactions, we need to check the static account keys
-            const accountKeys = transaction.transaction.message.staticAccountKeys || [];
-            
-            // Check if transaction is from a watched wallet
-            const watchedWallet = this.wallets.find(wallet => 
-                accountKeys.some(key => 
-                    key.toBase58() === wallet.address
-                )
+            // Get wallet info for this transaction
+            const walletInfo = this.wallets.find(w => 
+                logs.address === w.address || 
+                tx.transaction.message.accountKeys.some(key => key.toString() === w.address)
             );
 
-            if (watchedWallet) {
-                console.log(`Detected transaction from ${watchedWallet.label}:`, logs.signature);
-                await this.analyzePurchaseTransaction(transaction, watchedWallet);
+            if (!walletInfo) {
+                return;
             }
+
+            let tradeStatus = false;
+            let tradeMessage = '';
+
+            try {
+                // Process the transaction
+                const { status, message } = await this.processTx(tx, walletInfo);
+                tradeStatus = status;
+                tradeMessage = message;
+            } catch (error) {
+                console.error(`[${this.CHAIN_NAME}] Error processing transaction:`, error);
+                tradeStatus = false;
+                tradeMessage = `Error processing transaction: ${error.message}`;
+            }
+
+            // Try to update ledger, but don't fail if it errors
+            try {
+                if (tradeStatus) {
+                    // Get post-tokens after successful trade
+                    const postTokens = await this.getWalletTokens(walletInfo.address);
+                    for (const token of postTokens) {
+                        const exists = await ledger.hasHolding('solana', token);
+                        if (!exists) {
+                            await ledger.addHolding('solana', token);
+                            console.log(`[${this.CHAIN_NAME}] Added new token to ledger:`, token);
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error(`[${this.CHAIN_NAME}] Error updating ledger:`, error);
+                // Don't modify tradeStatus - the trade itself was successful
+            }
+
+            // Send telegram message about the trade
+            if (tradeMessage) {
+                try {
+                    await this.sendTelegramMessage(tradeMessage, true);
+                } catch (error) {
+                    console.error(`[${this.CHAIN_NAME}] Error sending telegram message:`, error);
+                }
+            }
+
         } catch (error) {
-            console.error('Error processing transaction:', error);
+            console.error(`[${this.CHAIN_NAME}] Error in handleLogs:`, error);
         }
     }
 
-    async analyzePurchaseTransaction(transaction, wallet) {
-        if (!transaction?.meta) return;
-
+    async getWalletTokens(walletAddress) {
         try {
-            const txSignature = transaction.transaction.signatures[0];
-            if (this.processedTxs.has(txSignature)) return;
+            const tokens = new Set();
+            
+            // Add SOL if there's a balance
+            const solBalance = await this.connection.getBalance(new PublicKey(walletAddress));
+            if (solBalance > 0) {
+                tokens.add(this.WSOL_ADDRESS);
+            }
 
-            // Add transaction to processed set immediately to prevent duplicate processing
-            this.processedTxs.add(txSignature);
+            // Get token accounts
+            const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                new PublicKey(walletAddress),
+                { programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') }
+            );
 
-            const postTokenBalances = transaction.meta.postTokenBalances || [];
-            const preTokenBalances = transaction.meta.preTokenBalances || [];
-
-            // Define tokens to skip
-            const SKIP_TOKENS = new Set([
-                'So11111111111111111111111111111111111111112', // Native SOL
-                'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-                '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', // USDC (alternate)
-                'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
-                'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // Bonk
-                'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // mSOL
-                'DUSTawucrTsGU8hcqRdHDCbuYhCPADMLM2VcCb8VnFnQ', // DUST
-            ]);
-
-            // Track if we've already executed a copy trade for this transaction
-            let copyTradeExecuted = false;
-
-            // Check for sells of tokens we hold
-            for (const preBalance of preTokenBalances) {
-                const tokenMint = preBalance.mint;
-                // Check if we currently hold this token
-                try {
-                    const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
-                        this.traderWallet.publicKey,
-                        { mint: new PublicKey(tokenMint) }
-                    );
-
-                    if (tokenAccounts.value.length > 0) {
-                        const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
-                        if (Number(balance.amount) > 0) {
-                            const postBalance = postTokenBalances.find(b => b.mint === tokenMint);
-                            const preBal = Number(preBalance.uiTokenAmount.amount);
-                            const postBal = postBalance ? Number(postBalance.uiTokenAmount.amount) : 0;
-
-                            if (postBal < preBal) {
-                                await this.notifySell({
-                                    tokenMint,
-                                    sourceWallet: wallet.label,
-                                    txSignature
-                                });
-                            }
-                        }
-                    }
-                } catch (error) {
-                    console.error(`Error checking token balance:`, error);
+            // Add tokens with non-zero balance
+            for (const account of tokenAccounts.value) {
+                const tokenAmount = account.account.data.parsed.info.tokenAmount;
+                if (tokenAmount.uiAmount > 0) {
+                    tokens.add(account.account.data.parsed.info.mint);
                 }
             }
 
-            // Look for token purchases (new tokens or balance increases)
-            for (const postBalance of postTokenBalances) {
-                if (SKIP_TOKENS.has(postBalance.mint)) continue;
-
-                const preBalance = preTokenBalances.find(b => b.mint === postBalance.mint);
-                const preBal = preBalance ? Number(preBalance.uiTokenAmount.amount) : 0;
-                const postBal = Number(postBalance.uiTokenAmount.amount);
-
-                if (postBal > preBal && !copyTradeExecuted) {
-                    const balanceIncrease = postBal - preBal;
-                    console.log(`[${this.CHAIN_NAME}] Purchase detected by ${wallet.label}:
-                        Token: ${postBalance.mint}
-                        Previous Balance: ${preBal}
-                        New Balance: ${postBal}
-                        Increase: ${balanceIncrease}
-                    `);
-
-                    await this.executeCopyTrade({
-                        tokenAddress: postBalance.mint,
-                        symbol: postBalance.mint.slice(0, 4) + '...',
-                        sourceWallet: wallet.label
-                    });
-
-                    // Mark that we've executed a copy trade for this transaction
-                    copyTradeExecuted = true;
-                }
-            }
-
-            // Clean up old transactions from the Set (keep last 1000)
-            if (this.processedTxs.size > 1000) {
-                const txsArray = Array.from(this.processedTxs);
-                this.processedTxs = new Set(txsArray.slice(-1000));
-            }
-
+            return Array.from(tokens);
         } catch (error) {
-            console.error(`Error analyzing transaction for ${wallet.label}:`, error);
+            console.error(`[${this.CHAIN_NAME}] Error getting wallet tokens:`, error);
+            return [];
         }
     }
 
@@ -197,28 +178,42 @@ class SolanaMonitor {
                 throw new Error('Trader wallet not configured');
             }
 
-            // Check if we already hold this token
+            // First check if we already hold this token
+            try {
+                const hasToken = await ledger.hasHolding('solana', purchaseInfo.tokenAddress);
+                if (hasToken) {
+                    console.log(`[${this.CHAIN_NAME}] We already hold ${purchaseInfo.symbol}, skipping purchase`);
+                    await this.sendTelegramMessage(
+                        `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                        `*${purchaseInfo.sourceWallet}* bought *${purchaseInfo.symbol}*\n` +
+                        `Trade skipped - Already holding this token`,
+                        true
+                    );
+                    return;
+                }
+            } catch (error) {
+                console.error(`[${this.CHAIN_NAME}] Error checking our holdings:`, error);
+            }
+
+            // Then check if source wallet already holds this token
             try {
                 const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
-                    this.traderWallet.publicKey,
+                    new PublicKey(purchaseInfo.sourceAddress),
                     { mint: new PublicKey(purchaseInfo.tokenAddress) }
                 );
 
                 if (tokenAccounts.value.length > 0) {
-                    const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount;
-                    if (Number(balance.amount) > 0) {
-                        console.log(`[${this.CHAIN_NAME}] Already holding ${purchaseInfo.symbol}, skipping purchase`);
-                        await this.sendTelegramMessage(
-                            `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
-                            `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.symbol}*\n` +
-                            `You already hold this token - Trade skipped`,
-                            true
-                        );
-                        return;
-                    }
+                    console.log(`[${this.CHAIN_NAME}] ${purchaseInfo.sourceWallet} already holds ${purchaseInfo.symbol}, skipping purchase`);
+                    await this.sendTelegramMessage(
+                        `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                        `*${purchaseInfo.sourceWallet}* is accumulating *${purchaseInfo.symbol}*\n` +
+                        `Trade skipped - Only copying initial entries`,
+                        true
+                    );
+                    return;
                 }
             } catch (error) {
-                console.error(`[${this.CHAIN_NAME}] Error checking token balance:`, error);
+                console.error(`[${this.CHAIN_NAME}] Error checking source wallet balance:`, error);
             }
 
             // Check wallet balance

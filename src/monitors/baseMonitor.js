@@ -313,17 +313,44 @@ class BaseMonitor {
         let currentTry = 0;
 
         try {
-            // Check if we already hold this token
-            const hasHolding = await ledger.hasHolding('base', purchaseInfo.tokenAddress);
-            if (hasHolding) {
-                console.log(`[${this.CHAIN_NAME}] Already holding ${purchaseInfo.symbol}, skipping purchase`);
-                await this.sendTelegramMessage(
-                    `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
-                    `*${purchaseInfo.sourceWallet}* bought more *${purchaseInfo.name} (${purchaseInfo.symbol})*\n` +
-                    `You already hold this token - Trade skipped`,
-                    true
-                );
-                return;
+            // First check if we already hold this token
+            try {
+                const hasToken = await ledger.hasHolding('base', purchaseInfo.tokenAddress);
+                if (hasToken) {
+                    console.log(`[${this.CHAIN_NAME}] We already hold ${purchaseInfo.symbol}, skipping purchase`);
+                    await this.sendTelegramMessage(
+                        `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                        `*${purchaseInfo.sourceWallet}* bought *${purchaseInfo.symbol}*\n` +
+                        `Trade skipped - Already holding this token`,
+                        true
+                    );
+                    return;
+                }
+            } catch (error) {
+                console.error(`[${this.CHAIN_NAME}] Error checking our holdings:`, error);
+            }
+
+            // Then check if source wallet already holds this token
+            const tokenContract = new ethers.Contract(
+                purchaseInfo.tokenAddress,
+                ['function balanceOf(address) view returns (uint256)'],
+                this.provider
+            );
+
+            try {
+                const balance = await tokenContract.balanceOf(purchaseInfo.sourceAddress);
+                if (!balance.isZero()) {
+                    console.log(`[${this.CHAIN_NAME}] ${purchaseInfo.sourceWallet} already holds ${purchaseInfo.symbol}, skipping purchase`);
+                    await this.sendTelegramMessage(
+                        `ℹ️ ${this.CHAIN_NAME} Trade Alert!\n\n` +
+                        `*${purchaseInfo.sourceWallet}* is accumulating *${purchaseInfo.symbol}*\n` +
+                        `Trade skipped - Only copying initial entries`,
+                        true
+                    );
+                    return;
+                }
+            } catch (error) {
+                console.error(`[${this.CHAIN_NAME}] Error checking source wallet balance:`, error);
             }
 
             console.log(`[${this.CHAIN_NAME}] Starting copy trade for ${purchaseInfo.name} (${purchaseInfo.symbol}) - Following ${purchaseInfo.sourceWallet}`);
