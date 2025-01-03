@@ -5,7 +5,7 @@ const path = require('path');
 require('dotenv').config();
 const { setupConfig, addWallet } = require('./utils/setup');
 const { startMonitor } = require('./monitor');
-const { backfillHoldings } = require('./utils/backfill');
+const { backfillHoldings, addSingleHolding } = require('./utils/backfill');
 const inquirer = require('inquirer');
 const ledger = require('./services/ledger');
 
@@ -237,6 +237,41 @@ function createCLI() {
                                 process.exit(0);
                             } catch (error) {
                                 console.error('Error clearing holdings:', error);
+                                process.exit(1);
+                            }
+                        })
+                )
+                .addCommand(
+                    program
+                        .command('add')
+                        .description('Add a single token to holdings')
+                        .option('-c, --chain <chain>', 'Chain (solana/base)')
+                        .option('-a, --address <address>', 'Token address')
+                        .action(async (options) => {
+                            try {
+                                if (!options.chain || !options.address) {
+                                    const answers = await inquirer.prompt([
+                                        {
+                                            type: 'list',
+                                            name: 'chain',
+                                            message: 'Select chain:',
+                                            choices: ['solana', 'base'],
+                                            when: !options.chain
+                                        },
+                                        {
+                                            type: 'input',
+                                            name: 'address',
+                                            message: 'Enter token address:',
+                                            when: !options.address
+                                        }
+                                    ]);
+                                    options = { ...options, ...answers };
+                                }
+
+                                await addSingleHolding(options.chain, options.address);
+                                console.log(`Successfully added ${options.address} to ${options.chain} holdings`);
+                            } catch (error) {
+                                console.error('Error adding holding:', error);
                                 process.exit(1);
                             }
                         })

@@ -260,7 +260,8 @@ class BaseMonitor {
                     tokenAddress,
                     symbol,
                     name,
-                    sourceWallet: wallet.label
+                    sourceWallet: wallet.label,
+                    sourceAddress: wallet.address
                 });
             }
 

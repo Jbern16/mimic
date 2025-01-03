@@ -13,6 +13,7 @@
     "skip-token:remove": "node index.js skip-token remove",
     "holdings:backfill": "node index.js holdings backfill",
     "holdings:clear": "node index.js holdings clear",
+    "holdings:add": "node index.js holdings add",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"

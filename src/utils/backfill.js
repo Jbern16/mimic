@@ -86,6 +86,7 @@ async function backfillHoldings(config, chain = 'all') {
                     });
 
                     const { trades, nextCursor } = response.data;
+                    console.log('Trades:', trades);
 
                     // Process trades
                     for (const trade of trades) {
@@ -169,7 +170,46 @@ async function backfillSolanaHoldings(walletAddress) {
     }
 }
 
+async function addSingleHolding(chain, tokenAddress) {
+    try {
+        console.log(`Adding ${chain} holding: ${tokenAddress}`);
+        
+        // Validate chain
+        if (!['solana', 'base'].includes(chain)) {
+            throw new Error('Invalid chain. Must be "solana" or "base"');
+        }
+
+        // Validate address format
+        if (chain === 'solana') {
+            try {
+                new PublicKey(tokenAddress);
+            } catch (error) {
+                throw new Error('Invalid Solana token address');
+            }
+        } else {
+            if (!ethers.utils.isAddress(tokenAddress)) {
+                throw new Error('Invalid Base token address');
+            }
+        }
+
+        // Add to ledger
+        await ledger.addHolding(chain, tokenAddress);
+        console.log(`Successfully added ${tokenAddress} to ${chain} holdings`);
+
+        // Close Redis connection
+        setTimeout(async () => {
+            await ledger.close();
+            process.exit(0);
+        }, 1000);
+
+    } catch (error) {
+        console.error('Error adding holding:', error);
+        process.exit(1);
+    }
+}
+
 module.exports = {
     backfillHoldings,
-    backfillSolanaHoldings
+    backfillSolanaHoldings,
+    addSingleHolding
 }; 
